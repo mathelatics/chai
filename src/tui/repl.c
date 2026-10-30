@@ -64,6 +64,11 @@ static mp_reply *complete_with_tools(mp_ctx *ctx, mp_toolreg *tools) {
             snprintf(host, sizeof host, "%s", "integrate.api.nvidia.com");
         }
         broker_host = host;
+        /* path component of base_url (e.g. /v1) -> chat/completions appended by nemotron.c */
+        const char *pp = strstr(prov->base_url, "://");
+        if (pp) { pp += 3; const char *sl = strchr(pp, '/');
+                  mp_nemotron_set_upstream_path(sl ? sl : "/v1"); }
+        else mp_nemotron_set_upstream_path("/v1");
     }
     mp_broker_set_key_env(key_hdr);   /* tells broker which env var holds the key */
     rctx rc = { g_thinking };

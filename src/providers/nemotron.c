@@ -204,10 +204,21 @@ static mp_reply *finish(sctx *s) {
 }
 
 static mp_reply *run_parsed(char *resp, size_t rlen, sctx *s) {
-    mp_sse *sse = mp_sse_new(on_sse_event, s);
-    mp_sse_feed(sse, resp, rlen);
-    mp_sse_flush(sse);
-    mp_sse_free(sse);
+    /* Two wire shapes arrive here:
+     *  - SSE stream: lines like "data: {...}" / "data: [DONE]"
+     *  - non-streaming: one raw JSON object starting with '{'
+     * Detect by sniffing the first non-whitespace byte; feeding raw JSON to the
+     * SSE line parser would silently drop it (no "data:" prefix). */
+    size_t i = 0;
+    while (i < rlen && (resp[i] == ' ' || resp[i] == '\t' || resp[i] == '\r' || resp[i] == '\n')) i++;
+    if (i < rlen && resp[i] == '{') {
+        on_sse_event("", resp + i, s);
+    } else {
+        mp_sse *sse = mp_sse_new(on_sse_event, s);
+        mp_sse_feed(sse, resp, rlen);
+        mp_sse_flush(sse);
+        mp_sse_free(sse);
+    }
     return finish(s);
 }
 

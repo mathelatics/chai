@@ -56,7 +56,13 @@ int mp_cfg_load(mp_config *c, const char *path_or_null) {
     set_defaults(c);
     char tmp[64];
     const char *em = getenv("MINIPI_MODEL");
-    if (em && *em) snprintf(c->v[0].model, sizeof c->v[0].model, "%s", em);
+    /* Only accept the env override if it looks like a full NVIDIA model id
+     * (contains '/'). A bare short name belongs in config.toml [session] or
+     * --model, and silently substituting it here yields upstream 404s. */
+    if (em && *em && strchr(em, '/'))
+        snprintf(c->v[0].model, sizeof c->v[0].model, "%s", em);
+    else if (em && *em)
+        log_warn("config: ignoring MINIPI_MODEL='%s' (not a full model id with '<org>/<name>'; use /models to discover valid ids)", em);
     const char *path = path_or_null;
     static char defp[4096];
     if (!path || !*path) {

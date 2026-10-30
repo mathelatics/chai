@@ -6,6 +6,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <ctype.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netdb.h>
@@ -72,6 +73,29 @@ int mp_broker_post(const char *path, const char *body, size_t body_len,
     char *bstart = sep + 4; size_t blen = len - (size_t)(bstart - buf);
     /* handle chunked transfer-encoding (broker sets content-length, but be safe) */
     if (memmem(buf, (size_t)(sep - buf), "Transfer-Encoding: chunked", 24)) {
+        /* Locate the FIRST hex chunk-size line at the start of the body. If it
+         * doesn't parse as a valid hex length, the upstream used identity
+         * framing and we must return the raw bytes verbatim — otherwise SSE
+         * payloads beginning with hex-like text ("27A\n{...}") get shredded. */
+        int looks_chunked = 0;
+        {
+            char *nl = memchr(bstart, '\n', blen);
+            if (nl) {
+                size_t sn = (size_t)(nl - bstart);
+                if (bstart[sn-1] == '\r') sn--;
+                if (sn > 0 && sn < 16) {
+                    for (size_t k = 0; k < sn; k++)
+                        if (!isxdigit((unsigned char)bstart[k])) { sn = 0; break; }
+                    if (sn) {
+                        errno = 0;
+                        char tmp[20]; memcpy(tmp, bstart, sn); tmp[sn] = 0;
+                        long csz = strtol(tmp, NULL, 16);
+                        if (errno == 0 && csz >= 0 && (size_t)csz <= blen) looks_chunked = 1;
+                    }
+                }
+            }
+        }
+        if (!looks_chunked) goto identity;
         size_t rl = 0, i = 0; char *src = bstart; char *dst = malloc(blen + 1);
         if (!dst) { free(buf); return -1; }
         while (i < blen) {
@@ -91,12 +115,15 @@ int mp_broker_post(const char *path, const char *body, size_t body_len,
         *out = dst; *out_len = rl; *out = realloc(*out, rl ? rl : 1);
         return status;
     }
+identity:
+    {
     char *res = malloc(blen + 1);
     if (!res) { free(buf); return -1; }
     memcpy(res, bstart, blen); res[blen] = 0;
     free(buf);
     *out = res; *out_len = blen;
     return status;
+    }
 }
 
 /* ---- loopback HTTP for local inference (LM Studio/Ollama/llama.cpp) ---- */
