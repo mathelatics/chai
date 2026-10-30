@@ -31,6 +31,11 @@ static mp_reply *complete_routed(const char *model, mp_ctx *ctx, mp_toolreg *too
             if (len && len < sizeof host) { memcpy(host, p, len); host[len] = 0; broker_host = host; }
         }
         if (!broker_host) { snprintf(host, sizeof host, "%s", "integrate.api.nvidia.com"); broker_host = host; }
+        /* path component of base_url (e.g. /v1) -> chat/completions appended by nemotron.c */
+        const char *pp = strstr(prov->base_url, "://");
+        if (pp) { pp += 3; const char *sl = strchr(pp, '/');
+                  mp_nemotron_set_upstream_path(sl ? sl : "/v1"); }
+        else mp_nemotron_set_upstream_path("/v1");
     }
     mp_broker_set_key_env(prov->key_env[0] ? prov->key_env : "NVIDIA_API_KEY");
     mp_reply *r = mp_nemotron_stream_ex(m, ctx, 0, 4096, 0.2, 0.95, NULL, NULL,

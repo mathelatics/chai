@@ -65,3 +65,9 @@ add_test(NAME smoke_deps COMMAND smoke_deps)
 add_executable(test_minipi tests/test_minipi.c)
 target_link_libraries(test_minipi PRIVATE minipi_core)
 add_test(NAME unit_tests COMMAND test_minipi)
+
+# --- minipi-broker: pure-C TLS boundary (replaces tools/tls_broker.py) ------
+# Separate executable so the MIT-only core never links OpenSSL.
+find_package(OpenSSL REQUIRED)
+add_executable(minipi-broker src/net/tls_broker_main.c)
+target_link_libraries(minipi-broker PRIVATE OpenSSL::SSL OpenSSL::Crypto)

@@ -1,7 +1,7 @@
 /* NVIDIA Nemotron / OpenAI-compatible streaming (M2+).
  * Two transports:
  *   - cloud kinds (nemotron/openai/anthropic-hosted): plaintext HTTP to the
- *     localhost TLS broker (tools/tls_broker.py); key lives ONLY in broker env.
+ *     localhost TLS broker (./build/minipi-broker); key lives ONLY in broker env.
  *   - openai-local kind (LM Studio/Ollama/llama.cpp): direct plaintext POST,
  *     loopback-only enforced here; no key involved.
  * Handles delta.content, delta.reasoning_content (nemotron thinking), and
@@ -15,6 +15,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Upstream path derived from provider base_url (e.g. /v1/chat/completions).
+ * Set by complete_routed() before each cloud call; empty -> default NVIDIA. */
+static char g_upstream_path[256];
+void mp_nemotron_set_upstream_path(const char *p) {
+    if (!p) { g_upstream_path[0] = 0; return; }
+    snprintf(g_upstream_path, sizeof g_upstream_path, "%s", p);
+}
 
 typedef struct { char *buf; size_t len, cap; } gbuf;
 static void gbuf_add(gbuf *g, const char *s, size_t n) {
@@ -206,6 +214,7 @@ static mp_reply *run_parsed(char *resp, size_t rlen, sctx *s) {
 mp_reply *mp_nemotron_stream(const char *model, const mp_ctx *ctx,
                              int enable_thinking, long max_tokens, double temperature,
                              double top_p, mp_stream_fn on_delta, void *ud) {
+    mp_nemotron_set_upstream_path("/v1");
     return mp_nemotron_stream_ex(model, ctx, enable_thinking, max_tokens, temperature,
                                  top_p, on_delta, ud, NULL, NULL, 0);
 }
@@ -261,11 +270,13 @@ mp_reply *mp_nemotron_stream_ex(const char *model, const mp_ctx *ctx,
          * (absolute-form URI to the broker adds the 127.0.0.1:port netloc). The
          * upstream path must come from the provider's base_url (e.g. /v1/chat/
          * completions for NVIDIA/OpenAI), NOT be hardcoded per host. */
-        snprintf(path, sizeof path, "/%s%s", host, g_upstream_path[0] ? g_upstream_path : "/v1/chat/completions");
+        char upfx[300]; snprintf(upfx, sizeof upfx, "%s", g_upstream_path[0] ? g_upstream_path : "/v1");
+        if (upfx[strlen(upfx)-1] == '/') upfx[strlen(upfx)-1] = 0;
+        snprintf(path, sizeof path, "/%s%s/chat/completions", host, upfx);
         status = mp_broker_post(path, txt, strlen(txt), &resp, &rlen);
     }
     free(txt);
-    if (status < 0) { log_error("provider: transport failed (cloud? start tools/tls_broker.py; local? is the server up?)"); free(resp); return NULL; }
+    if (status < 0) { log_error("provider: transport failed (cloud? start ./build/minipi-broker; local? is the server up?)"); free(resp); return NULL; }
     if (status != 200) { log_error("provider: HTTP %d: %.512s", status, resp ? resp : ""); free(resp); return NULL; }
     mp_reply *r = run_parsed(resp, rlen, &s);
     free(resp);
