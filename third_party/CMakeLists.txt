@@ -23,3 +23,18 @@ target_include_directories(tomlc17 PUBLIC ${CMAKE_CURRENT_LIST_DIR}/tomlc17/incl
 add_library(ureq INTERFACE)
 target_include_directories(ureq INTERFACE ${CMAKE_CURRENT_LIST_DIR}/ureq/include)
 target_link_libraries(ureq INTERFACE cjson http_parser)
+
+# klib — header-only data structures: khash, kvec, klist, ksort, kstring
+# (attractivechaos/klib, MIT). INTERFACE target; no compilation needed.
+add_library(klib INTERFACE)
+target_include_directories(klib INTERFACE ${CMAKE_CURRENT_LIST_DIR}/klib/include)
+
+# termbox2 — single-header terminal UI (termbox/termbox2, MIT).
+# Implementation instantiated in termbox2_impl.c (TB_IMPL shim TU).
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/termbox2 termbox2-build)
+
+# libuv — event loop, timers, child processes, tty (libuv/libuv, MIT).
+# Linux-only minimal static build; hand-written CMakeLists (see VENDORED.md).
+if(UNIX AND NOT APPLE)
+  add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/libuv libuv-build)
+endif()
