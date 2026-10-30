@@ -88,3 +88,79 @@ int mp_broker_post(const char *path, const char *body, size_t body_len,
     *out = res; *out_len = blen;
     return status;
 }
+
+/* ---- loopback HTTP for local inference (LM Studio/Ollama/llama.cpp) ---- */
+static int split_url(const char *url, const char *path, char *hostbuf, size_t hn,
+                     int *port, char *uri, size_t un) {
+    const char *base = NULL;
+    int p = 80;
+    if (!strncmp(url, "http://127.0.0.1", 16)) base = "127.0.0.1";
+    else if (!strncmp(url, "http://localhost", 16)) base = "localhost";
+    else return -2;
+    const char *rest = url + (base[0] == 'l' ? 16 : 16);
+    /* skip past scheme+host prefix length properly */
+    rest = url + strlen("http://") + strlen(base);
+    if (*rest == ':') { p = atoi(rest + 1); while (*rest && *rest != '/') rest++; }
+    while (*rest == '/') rest++;
+    snprintf(hostbuf, hn, "%s", base);
+    *port = p;
+    /* uri = /<remaining-base>/<path> */
+    char tail[512];
+    if (*rest) snprintf(tail, sizeof tail, "/%s", rest); else tail[0] = 0;
+    if (tail[strlen(tail)-1] == '/') tail[strlen(tail)-1] = 0;
+    snprintf(uri, un, "%s%s", tail, path);
+    return 0;
+}
+
+int mp_local_http(const char *url_base, const char *path, const char *method,
+                  const char *body, size_t body_len, char **out, size_t *out_len) {
+    if (!url_base || !path || !method || !out || !out_len) return -1;
+    char host[64], uri[1024]; int port = 0;
+    if (split_url(url_base, path, host, sizeof host, &port, uri, sizeof uri) < 0) {
+        return -2; /* refused: not loopback */
+    }
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
+    char portstr[8]; snprintf(portstr, sizeof portstr, "%d", port);
+    if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) return -1;
+    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) { freeaddrinfo(res); return -1; }
+    if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) { close(fd); freeaddrinfo(res); return -1; }
+    freeaddrinfo(res);
+    char hdr[1024];
+    int hl = snprintf(hdr, sizeof hdr,
+        "%s %s HTTP/1.1\r\nHost: %s:%d\r\nAccept: application/json\r\n"
+        "Content-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
+        method, uri, host, port, body ? body_len : 0);
+    if (hl < 0 || (size_t)hl >= sizeof hdr) { close(fd); return -1; }
+    if (write(fd, hdr, hl) != hl) { close(fd); return -1; }
+    size_t off = 0;
+    while (body && off < body_len) {
+        ssize_t w = write(fd, body + off, body_len - off);
+        if (w <= 0) { close(fd); return -1; }
+        off += (size_t)w;
+    }
+    size_t cap = 65536, len = 0; char *buf = malloc(cap);
+    if (!buf) { close(fd); return -1; }
+    for (;;) {
+        if (len + 8192 > cap) { cap *= 2; char *nb = realloc(buf, cap); if (!nb) { free(buf); close(fd); return -1; } buf = nb; }
+        ssize_t r = read(fd, buf + len, cap - len);
+        if (r < 0) { if (errno == EINTR) continue; free(buf); close(fd); return -1; }
+        if (r == 0) break;
+        len += (size_t)r;
+    }
+    close(fd);
+    char *sep = memmem(buf, len, "\r\n\r\n", 4);
+    if (!sep) { free(buf); return -1; }
+    size_t status_line_len = strcspn(buf, "\r\n");
+    int status = 0;
+    if (status_line_len >= 12) sscanf(buf + 9, "%d", &status);
+    char *bstart = sep + 4; size_t blen = len - (size_t)(bstart - buf);
+    char *res2 = malloc(blen + 1);
+    if (!res2) { free(buf); return -1; }
+    memcpy(res2, bstart, blen); res2[blen] = 0;
+    free(buf);
+    *out = res2; *out_len = blen;
+    return status;
+}

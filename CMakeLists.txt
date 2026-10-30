@@ -20,6 +20,7 @@ add_library(minipi_core STATIC
   src/util/sha256.c
   src/util/base64.c
   src/util/uuid.c
+  src/util/paths.c
   src/util/utf8.c
   src/util/diff.c
   src/util/schema.c
@@ -42,6 +43,8 @@ add_library(minipi_core STATIC
   src/mcp/client.c
   src/net/broker_client.c
   src/net/tls_broker.c
+  src/config/config.c
+  src/security/policy.c
   src/providers/nemotron.c
   src/tui/app.c
   src/tui/repl.c

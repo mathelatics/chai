@@ -1,96 +1,112 @@
-/* MiniPi entry point: config (tomlc17) -> logging (log.c) -> agent + TUI. */
+/* mini-pi entry point. Pure C only — no Python at runtime.
+ * Security model: the API key NEVER enters this binary's code or config files.
+ * It lives in .env, exported into the localhost TLS broker's environment at
+ * launch; providers store only the NAME of the env var (key_env). The C client
+ * talks plaintext to the 127.0.0.1 broker (cloud) or directly to a loopback
+ * OpenAI-compatible server (LM Studio / Ollama / llama.cpp local inference).
+ * All management (connect provider, pick model, permission mode) happens in
+ * the REPL/TUI; every tool call is gated by security/policy before execution. */
+#define _GNU_SOURCE
 #include "agent/loop.h"
-#include "tui/app.h"
-#include "providers/provider.h"
-#include "session/compact.h"
-#include "tomlc17.h"
+#include "tools/registry.h"
+#include "session/store.h"
+#include "security/policy.h"
+#include "config/config.h"
+#include "util/paths.h"
 #include "log.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <sys/stat.h>
-typedef struct { char model[128]; char base_url[512]; long token_budget; int max_turns; } minipi_cfg;
-static int load_config(minipi_cfg *c, const char *path) {
-    strcpy(c->model, "nvidia/nemotron-3.5-lightning-30b-a3b"); c->base_url[0] = 0;
-    { const char *em = getenv("MINIPI_MODEL"); if (em && *em) snprintf(c->model, sizeof c->model, "%s", em); }
-    c->token_budget = 120000; c->max_turns = 8;
-    char cfgpath[4096];
-    if (path && *path) snprintf(cfgpath, sizeof cfgpath, "%s", path);
-    else snprintf(cfgpath, sizeof cfgpath, "%s/.minipi/config.toml", getenv("HOME") ? getenv("HOME") : ".");
-    FILE *fp = fopen(cfgpath, "r");
-    if (!fp) return 0;                       /* missing config is fine: defaults */
-    toml_result_t res = toml_parse_file(fp);
-    fclose(fp);
-    if (!res.ok) { fprintf(stderr, "config: %s\n", res.errmsg); toml_free(res); return -1; }
-    toml_datum_t top = res.toptab;
-    toml_datum_t m = toml_get(top, "model");
-    if (m.type == TOML_STRING) snprintf(c->model, sizeof c->model, "%.*s", m.u.str.len, m.u.s);
-    toml_datum_t u = toml_get(top, "base_url");
-    if (u.type == TOML_STRING) snprintf(c->base_url, sizeof c->base_url, "%.*s", u.u.str.len, u.u.s);
-    toml_datum_t b = toml_get(top, "token_budget");
-    if (b.type == TOML_INT64) c->token_budget = (long)b.u.int64;
-    toml_datum_t mt = toml_get(top, "max_turns");
-    if (mt.type == TOML_INT64 && mt.u.int64 >= 1 && mt.u.int64 <= 64) c->max_turns = (int)mt.u.int64;
-    toml_free(res);
-    return 0;
+#include <errno.h>
+
+static void usage(const char *argv0) {
+    fprintf(stderr,
+        "usage: %s [--thinking] [--prompt TEXT] [--auto-approve] [--model NAME]\n"
+        "             [--max-tokens N] [--budget N] [--root DIR] [--resume FILE.jsonl]\n"
+        "             [--policy ask|auto-read|full-auto]\n"
+        "  default: interactive REPL (streaming + thinking off).\n"
+        "  --thinking     show reasoning stream (nemotron delta.reasoning_content)\n"
+        "  --prompt TEXT  one-shot mode; FAILS CLOSED: tools need --auto-approve\n"
+        "  --auto-approve full-auto policy for one-shot (HIGH risk still blocked)\n"
+        "  keys: keep them in .env -> broker env only (see README)\n", argv0);
 }
-static void usage(void) {
-    puts("usage: minipi [options]\n"
-         "  --config PATH   TOML config (default ~/.minipi/config.toml)\n"
-         "  --model NAME    override model\n"
-         "  --base-url URL  dev-mode HTTP base url (http://127.0.0.1... only)\n"
-         "  --prompt TEXT   one-shot non-interactive turn (prints reply, exits)\n"
-         "  --thinking      enable nemotron reasoning stream (delta.reasoning_content)\n"
-         "  --help          this text\n");
-}
-/* streaming sink for --prompt mode */
-static void print_delta(const char *reasoning, const char *content, void *ud) {
-    (void)ud;
-    if (reasoning) fputs(reasoning, stdout);
-    if (content) fputs(content, stdout);
-    fflush(stdout);
-}
+
 int main(int argc, char **argv) {
-    log_set_quiet(argc > 1); /* noisy logs only when flags given? keep quiet in REPL */
-    minipi_cfg c; load_config(&c, NULL);
-    const char *oneshot = NULL; int thinking = 0;
+    int thinking = 0, auto_approve = 0;
+    const char *prompt = NULL, *model_override = NULL;
+    long max_tokens = 16384, budget = 120000;
+    const char *resume = NULL;
+    (void)getenv("MINIPI_ROOT"); /* --root handled by REPL/TUI workspace confinement */
+    mp_pmode pmode = MP_MODE_ASK_ALWAYS;
+    int have_policy_flag = 0;
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--help")) { usage(); return 0; }
-        else if (!strcmp(argv[i], "--config") && i + 1 < argc) load_config(&c, argv[++i]);
-        else if (!strcmp(argv[i], "--model") && i + 1 < argc) snprintf(c.model, sizeof c.model, "%s", argv[++i]);
-        else if (!strcmp(argv[i], "--base-url") && i + 1 < argc) snprintf(c.base_url, sizeof c.base_url, "%s", argv[++i]);
-        else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) oneshot = argv[++i];
-        else if (!strcmp(argv[i], "--thinking")) thinking = 1;
-        else { fprintf(stderr, "unknown option: %s\n", argv[i]); usage(); return 2; }
+        if (!strcmp(argv[i], "--thinking")) thinking = 1;
+        else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt = argv[++i];
+        else if (!strcmp(argv[i], "--model") && i + 1 < argc) model_override = argv[++i];
+        else if (!strcmp(argv[i], "--max-tokens") && i + 1 < argc) max_tokens = atol(argv[++i]);
+        else if (!strcmp(argv[i], "--budget") && i + 1 < argc) budget = atol(argv[++i]);
+        else if (!strcmp(argv[i], "--resume") && i + 1 < argc) resume = argv[++i];
+        else if (!strcmp(argv[i], "--auto-approve")) auto_approve = 1;
+        else if (!strcmp(argv[i], "--policy") && i + 1 < argc) {
+            if (mp_mode_parse(argv[++i], &pmode)) { fprintf(stderr, "bad --policy\n"); return 2; }
+            have_policy_flag = 1;
+        }
+        else { usage(argv[0]); return 2; }
     }
-    if (*c.base_url) mp_provider_set_base_url(c.base_url);
+
+    /* Load config first: it seeds active provider/model/policy from
+     * ~/.minipi/config.toml plus built-in defaults (nemotron pre-registered). */
+    mp_config cfg;
+    mp_cfg_load(&cfg, NULL);
+    if (model_override && cfg.active[0]) {
+        mp_provider *p = mp_cfg_active(&cfg);
+        if (p) snprintf(cfg.session_model, sizeof cfg.session_model, "%s", model_override);
+        else snprintf(p->model, sizeof p->model, "%s", model_override);
+    }
+    if (!have_policy_flag && cfg.policy_mode[0])
+        mp_mode_parse(cfg.policy_mode, &pmode);
+
+    /* Loud session-dir diagnostics: a wrong/missing $HOME used to silently drop
+     * all persistence (the rc=1 mystery). Now we print exactly where it goes. */
+    const char *mdir = mp_minipi_dir();
+    if (!mdir) log_warn("main: no usable home (%s) — sessions will NOT persist", mp_home_error());
+    else {
+        char sd[4096]; snprintf(sd, sizeof sd, "%s/sessions", mdir);
+        log_info("main: session dir target: %s", sd);
+    }
+
+    /* Resume path: verify hash chain BEFORE replaying anything. */
+    if (resume) {
+        int v = mp_store_verify(resume);
+        if (v != 0) { fprintf(stderr, "refusing to resume %s: integrity check failed (%d)\n", resume, v); return 1; }
+    }
+
     mp_bus *bus = mp_bus_new();
-    mp_agent_cfg ac = { c.model, c.max_turns, c.token_budget };
-    mp_agent *a = mp_agent_new(&ac, bus);
-    if (!a) { fprintf(stderr, "agent init failed\n"); return 1; }
-    const char *home = getenv("HOME") ? getenv("HOME") : "/tmp";
-    char sessdir[4096]; snprintf(sessdir, sizeof sessdir, "%s/.minipi/sessions", home);
-    mkdir(sessdir, 0700);
-    if (oneshot) {
-        /* NVIDIA live path: route through broker + SSE streaming. Key comes ONLY
-         * from the broker's env (NVIDIA_API_KEY), never stored in this binary. */
-        mp_ctx *ctx = mp_agent_ctx(a);
-        mp_ctx_push(ctx, "user", oneshot, NULL);
-        mp_reply *r = mp_nemotron_stream(c.model, ctx, thinking, 16384, 1.0, 0.95,
-                                         print_delta, NULL);
-        if (!r) { fprintf(stderr, "minipi: provider call failed (is the broker up?)\n");
-                  mp_agent_free(a); mp_bus_free(bus); return 3; }
-        mp_ctx_push(ctx, "assistant", r->text ? r->text : "", NULL);
-        printf("\n[tokens in=%ld out=%ld]\n", r->input_tokens, r->output_tokens);
-        mp_reply_free(r);
-        mp_agent_free(a); mp_bus_free(bus);
-        return 0;
+    mp_agent_cfg acfg = { .model = cfg.active[0] ? (cfg.session_model[0] ? cfg.session_model : mp_cfg_active(&cfg)->model)
+                                                  : "offline-stub",
+                          .max_turns = cfg.max_turns ? cfg.max_turns : 8,
+                          .token_budget = budget };
+    (void)budget; (void)pmode;
+    mp_agent *agent = mp_agent_new(&acfg, bus);
+    mp_toolreg *tools = mp_agent_tools(agent);
+    if (!agent) { fprintf(stderr, "agent init failed\n"); return 1; }
+    if (resume) {
+        mp_ctx *ctx = mp_agent_ctx(agent);
+        if (mp_store_replay(resume, ctx) < 0) { fprintf(stderr, "resume replay failed\n"); return 1; }
     }
-    /* Interactive REPL against the live streaming provider (pure C). */
-    int rc = mp_repl_run(a, c.model, thinking, 16384, sessdir);
-    mp_compact_if_needed(mp_agent_ctx(a), c.token_budget);
-    mp_tui_free(NULL); /* legacy TUI unused in REPL mode */
-    mp_agent_free(a); mp_bus_free(bus);
-    return rc;
+
+    int rc;
+    if (prompt) {
+        /* One-shot fail-closed path uses the core loop with an approving bus
+         * subscriber so nothing runs silently: without --auto-approve any
+         * side-effecting tool is DENIED (interactive=0 inside the policy). */
+        mp_policy *pol = mp_policy_new(auto_approve ? MP_MODE_FULL_AUTO : pmode, 0);
+        rc = mp_agent_run_turn_pol(agent, prompt, pol, tools);
+        mp_policy_free(pol);
+    } else {
+        rc = mp_repl_run(agent, NULL, thinking, max_tokens, NULL);
+    }
+    mp_agent_free(agent);
+    mp_bus_free(bus);
+    return rc == -2 ? 1 : (rc < 0 ? 1 : 0);
 }
