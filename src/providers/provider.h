@@ -17,4 +17,17 @@ typedef void (*mp_stream_fn)(const char *reasoning_delta, const char *content_de
 mp_reply *mp_nemotron_stream(const char *model, const mp_ctx *ctx,
                              int enable_thinking, long max_tokens, double temperature,
                              double top_p, mp_stream_fn on_delta, void *ud);
+
+/* Extended streaming entry: routes to the TLS broker (cloud) or directly to a
+ * loopback OpenAI-compatible server (local inference). tools is the registry
+ * schema array [{name,schema}] (may be NULL); local_base like
+ * "http://127.0.0.1:1234/v1" (NULL => cloud via broker with broker_host). */
+/* Advertise the upstream path (from provider base_url) for broker routing. */
+void mp_nemotron_set_upstream_path(const char *p);
+
+mp_reply *mp_nemotron_stream_ex(const char *model, const mp_ctx *ctx,
+                                int enable_thinking, long max_tokens, double temperature,
+                                double top_p, mp_stream_fn on_delta, void *ud,
+                                const cJSON *tools, const char *local_base,
+                                const char *broker_host);
 #endif
