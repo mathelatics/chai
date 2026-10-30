@@ -11,7 +11,7 @@ Security properties:
   * no request/response logging of bodies or headers
 Run:  MINIPI_BROKER_PORT=8777 python3 tools/tls_broker.py
 """
-import json, os, ssl, sys, urllib.request, urllib.parse
+import json, os, ssl, sys, urllib.request, urllib.parse, re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ALLOWED_HOSTS = set(
@@ -54,7 +54,17 @@ class Handler(BaseHTTPRequestHandler):
             upath = "/" + (parts[1] if len(parts) > 1 else "")
             if host not in ALLOWED_HOSTS:
                 return self._reply(403, json.dumps({"error": "host not allowed", "got": host}).encode())
-            key = os.environ.get(KEY_ENV.get(host, ""))
+            # Client may name the env var holding its key (X-Minipi-Key-Env).
+            # Only ENV VAR NAMES are accepted; they must match the host's known
+            # key env or be a MINIPI-namespaced var — never a raw secret value.
+            key = None
+            want_env = (self.headers.get("X-Minipi-Key-Env") or "").strip()
+            known = KEY_ENV.get(host, "")
+            if want_env and (want_env == known or want_env.startswith("MINIPI_")) \
+                    and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", want_env):
+                key = os.environ.get(want_env)
+            if key is None:
+                key = os.environ.get(known)
             if not key:
                 return self._reply(500, b'{"error":"broker missing api key env"}')
             req = urllib.request.Request(

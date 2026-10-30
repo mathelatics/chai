@@ -102,6 +102,14 @@ int main(int argc, char **argv) {
          * side-effecting tool is DENIED (interactive=0 inside the policy). */
         mp_policy *pol = mp_policy_new(auto_approve ? MP_MODE_FULL_AUTO : pmode, 0);
         rc = mp_agent_run_turn_pol(agent, prompt, pol, tools);
+        /* Print the final assistant message (loop pushes it into ctx). */
+        mp_ctx *cctx = mp_agent_ctx(agent);
+        for (int i = cctx->n - 1; i >= 0; i--) {
+            mp_msg *m = &cctx->v[i];
+            if (m->role && !strcmp(m->role, "assistant") && m->content && *m->content) {
+                fputs(m->content, stdout); fputc('\n', stdout); break;
+            }
+        }
         mp_policy_free(pol);
     } else {
         rc = mp_repl_run(agent, NULL, thinking, max_tokens, NULL);

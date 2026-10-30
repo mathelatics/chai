@@ -2,9 +2,42 @@
 #include "tools/registry.h"
 #include "providers/provider.h"
 #include "security/policy.h"
+#include "config/config.h"
+#include "net/broker_client.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+
+extern mp_config g_cfg;   /* process-wide provider config (defined in tui/repl.c) */
+
+/* Route one completion through the live provider when a cloud/local provider is
+ * active; fall back to the deterministic offline stub otherwise. Keeps the
+ * --prompt one-shot path honest: same wire, same schemas, no interactive
+ * streamer (deltas are swallowed here; final text is emitted via the bus). */
+static mp_reply *complete_routed(const char *model, mp_ctx *ctx, mp_toolreg *tools) {
+    mp_provider *prov = mp_cfg_active(&g_cfg);
+    if (!prov)
+        return mp_provider_complete(model ? model : "offline-stub", ctx);
+    const char *m = g_cfg.session_model[0] ? g_cfg.session_model : prov->model;
+    cJSON *schemas = tools ? mp_toolreg_schemas(tools) : NULL;
+    char host[256]; const char *local_base = NULL, *broker_host = NULL;
+    if (prov->kind == MP_KIND_OPENAI_LOCAL) {
+        local_base = prov->base_url;
+    } else {
+        const char *p = strstr(prov->base_url, "://");
+        if (p) {
+            p += 3; const char *e = strchr(p, '/');
+            size_t len = e ? (size_t)(e - p) : strlen(p);
+            if (len && len < sizeof host) { memcpy(host, p, len); host[len] = 0; broker_host = host; }
+        }
+        if (!broker_host) { snprintf(host, sizeof host, "%s", "integrate.api.nvidia.com"); broker_host = host; }
+    }
+    mp_broker_set_key_env(prov->key_env[0] ? prov->key_env : "NVIDIA_API_KEY");
+    mp_reply *r = mp_nemotron_stream_ex(m, ctx, 0, 4096, 0.2, 0.95, NULL, NULL,
+                                        schemas, local_base, broker_host);
+    if (schemas) cJSON_Delete(schemas);
+    return r;
+}
 
 struct mp_agent { mp_agent_cfg cfg; mp_bus *bus; mp_ctx ctx; mp_toolreg *tools; };
 
@@ -32,7 +65,7 @@ int mp_agent_run_turn(mp_agent *a, const char *user_text){
     mp_event ev={MP_EV_USER_MSG,user_text,NULL}; mp_bus_emit(a->bus,&ev);
     mp_ctx_push(&a->ctx,"user",user_text,NULL);
     for(int turn=0;turn<a->cfg.max_turns;turn++){
-        mp_reply *r=mp_provider_complete(a->cfg.model,&a->ctx); /* M1 stub => deterministic echo */
+        mp_reply *r=complete_routed(a->cfg.model,&a->ctx,a->tools);
         if(!r)return -2;
         mp_event d={MP_EV_ASSISTANT_DELTA,r->text,NULL}; mp_bus_emit(a->bus,&d);
         if(r->tool_calls){
@@ -63,7 +96,7 @@ int mp_agent_run_turn_pol(mp_agent *a, const char *user_text, mp_policy *pol,
     mp_event ev={MP_EV_USER_MSG,user_text,NULL}; mp_bus_emit(a->bus,&ev);
     mp_ctx_push(&a->ctx,"user",user_text,NULL);
     for(int turn=0;turn<(a->cfg.max_turns>0?a->cfg.max_turns:8);turn++){
-        mp_reply *r=mp_provider_complete(a->cfg.model,&a->ctx);
+        mp_reply *r=complete_routed(a->cfg.model,&a->ctx,tools);
         if(!r)return -2;
         mp_event d={MP_EV_ASSISTANT_DELTA,r->text,NULL}; mp_bus_emit(a->bus,&d);
         if(r->tool_calls){

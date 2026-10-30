@@ -19,6 +19,11 @@ int mp_local_http(const char *url_base, const char *path, const char *method,
 #define mp_http_get_json_raw(base, path, out, olen) \
     mp_local_http((base), (path), "GET", NULL, 0, (out), (olen))
 
+/* Tell the broker which ENV VAR NAME holds the API key for this request
+ * (sent as X-Minipi-Key-Env header; the value never leaves minipi's env).
+ * Call before mp_broker_post(). Pass "" to clear. Thread-unsafe by design. */
+void mp_broker_set_key_env(const char *env_name);
+
 /* Display string for the configured broker endpoint (never contains secrets). */
 static inline const char *mp_broker_url(void) {
     static char b[64];

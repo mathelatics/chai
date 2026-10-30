@@ -21,6 +21,15 @@ static int connect_local(int port) {
     return fd;
 }
 
+/* Env-var NAME advertised to the broker via X-Minipi-Key-Env (name only,
+ * never the secret). Set by mp_broker_set_key_env() from the REPL/config. */
+static char g_key_env[64];
+
+void mp_broker_set_key_env(const char *env_name) {
+    if (!env_name || !*env_name) { g_key_env[0] = 0; return; }
+    snprintf(g_key_env, sizeof g_key_env, "%s", env_name);
+}
+
 int mp_broker_post(const char *path, const char *body, size_t body_len,
                    char **out, size_t *out_len) {
     const char *p = getenv("MINIPI_BROKER_PORT"); 
@@ -33,7 +42,8 @@ int mp_broker_post(const char *path, const char *body, size_t body_len,
     char hdr[1024];
     int hl = snprintf(hdr, sizeof hdr,
         "POST %s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nContent-Type: application/json"
-        "\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", uri, port, body_len);
+        "\r\nContent-Length: %zu\r\nConnection: close%s%s%s\r\n\r\n", uri, port, body_len,
+        g_key_env[0] ? "\r\nX-Minipi-Key-Env: " : "", g_key_env, "");
     if (hl < 0 || (size_t)hl >= sizeof hdr) { close(fd); return -1; }
     if (write(fd, hdr, hl) != hl) { close(fd); return -1; }
     size_t off = 0;

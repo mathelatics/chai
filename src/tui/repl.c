@@ -22,7 +22,7 @@
 #include <unistd.h>
 #include <ctype.h>
 
-static mp_config g_cfg;
+mp_config g_cfg;
 static mp_policy *g_policy = NULL;
 static int g_thinking = 0;
 static long g_max_tokens = 16384;
