@@ -40,6 +40,9 @@ add_library(minipi_core STATIC
   src/session/tree.c
   src/session/compact.c
   src/mcp/client.c
+  src/net/broker_client.c
+  src/net/tls_broker.c
+  src/providers/nemotron.c
   src/tui/app.c
   src/tui/render.c
 )

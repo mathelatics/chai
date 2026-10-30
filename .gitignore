@@ -1,1 +1,4 @@
 build/
+.env
+*.local
+.cache/

@@ -9,7 +9,11 @@ mp_sse *mp_sse_new(mp_sse_cb cb, void *ud) {
     return s; }
 void mp_sse_free(mp_sse *s){ if(!s)return; free(s->buf); free(s->data); free(s); }
 static void dispatch(mp_sse *s) {
-    if (s->dlen) { s->data[s->dlen] = '\0'; s->cb(s->ev[0]?s->ev:"message", s->data, s->ud); }
+    if (s->dlen) {
+        if (s->data[s->dlen-1] == '\n') s->dlen--;   /* spec: strip trailing LF */
+        s->data[s->dlen] = '\0';
+        s->cb(s->ev[0]?s->ev:"message", s->data, s->ud);
+    }
     s->dlen = 0; s->ev[0] = '\0';
 }
 static void handle_line(mp_sse *s, const char *line, size_t n) {

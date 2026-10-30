@@ -39,16 +39,28 @@ static void usage(void) {
          "  --config PATH   TOML config (default ~/.minipi/config.toml)\n"
          "  --model NAME    override model\n"
          "  --base-url URL  dev-mode HTTP base url (http://127.0.0.1... only)\n"
+         "  --prompt TEXT   one-shot non-interactive turn (prints reply, exits)\n"
+         "  --thinking      enable nemotron reasoning stream (delta.reasoning_content)\n"
          "  --help          this text\n");
+}
+/* streaming sink for --prompt mode */
+static void print_delta(const char *reasoning, const char *content, void *ud) {
+    (void)ud;
+    if (reasoning) fputs(reasoning, stdout);
+    if (content) fputs(content, stdout);
+    fflush(stdout);
 }
 int main(int argc, char **argv) {
     log_set_quiet(argc > 1); /* noisy logs only when flags given? keep quiet in REPL */
     minipi_cfg c; load_config(&c, NULL);
+    const char *oneshot = NULL; int thinking = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--help")) { usage(); return 0; }
         else if (!strcmp(argv[i], "--config") && i + 1 < argc) load_config(&c, argv[++i]);
         else if (!strcmp(argv[i], "--model") && i + 1 < argc) snprintf(c.model, sizeof c.model, "%s", argv[++i]);
         else if (!strcmp(argv[i], "--base-url") && i + 1 < argc) snprintf(c.base_url, sizeof c.base_url, "%s", argv[++i]);
+        else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) oneshot = argv[++i];
+        else if (!strcmp(argv[i], "--thinking")) thinking = 1;
         else { fprintf(stderr, "unknown option: %s\n", argv[i]); usage(); return 2; }
     }
     if (*c.base_url) mp_provider_set_base_url(c.base_url);
@@ -59,6 +71,21 @@ int main(int argc, char **argv) {
     const char *home = getenv("HOME") ? getenv("HOME") : "/tmp";
     char sessdir[4096]; snprintf(sessdir, sizeof sessdir, "%s/.minipi/sessions", home);
     mkdir(sessdir, 0700);
+    if (oneshot) {
+        /* NVIDIA live path: route through broker + SSE streaming. Key comes ONLY
+         * from env (NVIDIA_API_KEY is read by tools/tls_broker.py, never here). */
+        mp_ctx *ctx = mp_agent_ctx(a);
+        mp_ctx_push(ctx, "user", oneshot, NULL);
+        mp_reply *r = mp_nemotron_stream(c.model, ctx, thinking, 16384, 1.0, 0.95,
+                                         print_delta, NULL);
+        if (!r) { fprintf(stderr, "minipi: provider call failed (is the broker up?)\n");
+                  mp_agent_free(a); mp_bus_free(bus); return 3; }
+        mp_ctx_push(ctx, "assistant", r->text ? r->text : "", NULL);
+        printf("\n[tokens in=%ld out=%ld]\n", r->input_tokens, r->output_tokens);
+        mp_reply_free(r);
+        mp_agent_free(a); mp_bus_free(bus);
+        return 0;
+    }
     mp_tui *tui = mp_tui_new(isatty(0));
     int rc = mp_tui_run(tui, a);
     mp_compact_if_needed(mp_agent_ctx(a), c.token_budget);

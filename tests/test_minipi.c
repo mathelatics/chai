@@ -41,7 +41,8 @@ static void t_utf8(void){
     printf("utf8 ok\n"); }
 static void t_diff(void){ const char*a[]={"one","two","three"}; const char*b[]={"one","TWO","three"};
     mp_diff_hunk h[16]; int n=mp_diff_lines(a,3,b,3,h,16);
-    assert(n==3); assert(h[1].op==MP_DIFF_DEL&&h[2].op==MP_DIFF_ADD);
+    /* full walk emits ctx+del+add = 4 hunks */
+    assert(n==4); assert(h[0].op==MP_DIFF_CTX&&h[1].op==MP_DIFF_DEL&&h[2].op==MP_DIFF_ADD&&h[3].op==MP_DIFF_CTX);
     printf("diff ok\n"); }
 static void t_schema(void){ cJSON*s=cJSON_Parse(
     "{\"type\":\"object\",\"required\":[\"path\"],\"properties\":{\"path\":{\"type\":\"string\"}},\"additionalProperties\":false}");

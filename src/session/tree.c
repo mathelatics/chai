@@ -7,10 +7,10 @@ int mp_tree_add(mp_tree*t,const char*id,const char*parent,const char*role,const 
     if(!t||!id||!role)return -1;
     if((size_t)t->n>=65536)return -1;
     if(t->n==t->cap){int nc=t->cap?t->cap*2:32;mp_entry*v=realloc(t->v,(size_t)nc*sizeof*v);if(!v)return -1;t->v=v;t->cap=nc;}
-    char *di=dz(id); khint_t k=kh_put(sess_idx,t->idx,di,NULL);
-    if(kh_exist(t->idx,k)){free(di);return -1;}
-    kh_key(t->idx,k)=di; kh_val(t->idx,k)=t->n;
-    t->v[t->n]=(mp_entry){di,dz(parent),dz(role),dz(content)};
+    int ins=0; khint_t k=kh_put(sess_idx,t->idx,id,&ins);   /* khash copies the key string */
+    if(!ins)return -1;                                        /* duplicate id */
+    kh_val(t->idx,k)=t->n;
+    t->v[t->n]=(mp_entry){dz(id),dz(parent),dz(role),dz(content)};
     t->leaf=t->n; return t->n++;
 }
 const mp_entry *mp_tree_get(mp_tree*t,const char*id){

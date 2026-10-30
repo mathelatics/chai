@@ -15,13 +15,27 @@ static int val(unsigned char c){
     if(c>='A'&&c<='Z')return c-'A'; if(c>='a'&&c<='z')return c-'a'+26;
     if(c>='0'&&c<='9')return c-'0'+52; if(c=='+')return 62; if(c=='/')return 63; return -1;}
 int mp_b64_decode(const char *in,size_t n,unsigned char *out,size_t cap){
-    size_t o=0; uint32_t acc=0; int bits=0;
-    for(size_t i=0;i<n;i++){
-        char c=in[i]; if(c=='\n'||c=='\r'||c==' ')continue;
-        if(c=='='){if(bits>=18)return -1;acc<<=6;bits+=6;
-            if(bits>=8){bits-=8;if(o>=cap)return -1;out[o++]=(acc>>bits)&0xFF;}continue;}
-        int v=val((unsigned char)c); if(v<0)return -1;
-        acc=(acc<<6)|v;bits+=6;
-        if(bits>=8){bits-=8;if(o>=cap)return -1;out[o++]=(acc>>bits)&0xFF;}}
-    if(bits>7)return -1; return (int)o;
+    /* 4-char quantum decoder: skip whitespace, stop at padding. */
+    size_t o=0,i=0;
+    while(i<n){
+        unsigned char q[4]; int qi=0;
+        while(i<n&&qi<4){
+            char c=in[i++];
+            if(c=='\n'||c=='\r'||c==' '||c=='\t')continue;
+            if(c=='=')break;
+            int v=val((unsigned char)c); if(v<0)return -1;
+            q[qi++]=(unsigned char)v;
+        }
+        if(qi==0)break;                 /* trailing pad/whitespace only */
+        if(qi==1)return -1;             /* lone char is invalid */
+        uint32_t acc=((uint32_t)q[0]<<18)|((uint32_t)q[1]<<12)|
+                     ((qi>2?(uint32_t)q[2]:0)<<6)|((qi>3?(uint32_t)q[3]:0));
+        int bytes=(qi==4)?3:(qi==3?2:1);
+        for(int b=16;b>=0&&bytes>0;b-=8,bytes--){
+            if(o>=cap)return -1;
+            out[o++]=(unsigned char)((acc>>b)&0xFF);
+        }
+        if(qi<4)break;                  /* padded quantum ends the data */
+    }
+    return (int)o;
 }
