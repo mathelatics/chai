@@ -39,9 +39,14 @@ static void on_sse_event(const char *event, const char *data, void *p) {
     if (!strncmp(data, "[DONE]", 6)) return;
     cJSON *j = cJSON_Parse(data);
     if (!j) return; /* partial/keepalive line */
+    /* Accept BOTH wire shapes: SSE deltas {"choices":[{"delta":{...}}]} and a
+     * single non-streaming completion {"choices":[{"message":{...}}]}. The
+     * message/delta objects have identical field names (content,
+     * reasoning_content, tool_calls), so one parse path handles both. */
     const cJSON *ch = cJSON_GetObjectItemCaseSensitive(j, "choices");
     if (cJSON_IsArray(ch) && ch->child) {
         const cJSON *delta = cJSON_GetObjectItemCaseSensitive(ch->child, "delta");
+        if (!delta) delta = cJSON_GetObjectItemCaseSensitive(ch->child, "message");
         if (delta) {
             const cJSON *rc = cJSON_GetObjectItemCaseSensitive(delta, "reasoning_content");
             const cJSON *cc = cJSON_GetObjectItemCaseSensitive(delta, "content");
@@ -216,6 +221,17 @@ mp_reply *mp_nemotron_stream_ex(const char *model, const mp_ctx *ctx,
                                 const char *broker_host) {
     char *txt = build_body(model, ctx, enable_thinking, max_tokens, temperature, top_p, tools);
     if (!txt) return NULL;
+    /* One-shot (no streaming callback): ask the upstream for a single JSON
+     * completion instead of an SSE stream — some endpoints (NVIDIA's included)
+     * misbehave on stream:true with no incremental consumer. */
+    if (!on_delta) {
+        cJSON *b = cJSON_Parse(txt);
+        if (b) {
+            cJSON *st = cJSON_GetObjectItemCaseSensitive(b, "stream");
+            if (st) cJSON_ReplaceItemInObjectCaseSensitive(b, "stream", cJSON_CreateBool(0));
+            free(txt); txt = cJSON_PrintUnformatted(b); cJSON_Delete(b);
+        }
+    }
     sctx s; memset(&s, 0, sizeof s);
     s.cb = on_delta; s.ud = ud;
     int status = -1; char *resp = NULL; size_t rlen = 0;
@@ -225,12 +241,27 @@ mp_reply *mp_nemotron_stream_ex(const char *model, const mp_ctx *ctx,
             log_error("provider: refusing non-loopback base_url for local provider: %s", local_base);
             free(txt); return NULL;
         }
-        status = mp_http_post_json_raw(local_base, "/chat/completions", txt, &resp, &rlen);
+        /* base_url may include a path prefix (e.g. http://127.0.0.1:1234/v1 or
+         * http://127.0.0.1:11434/v1 for ollama). Split host from prefix and
+         * append /chat/completions to the prefix. */
+        char hpfx[512]; const char *slash = strchr(local_base + 8, '/');
+        char base_only[512]; size_t hlen;
+        if (slash) { hlen = (size_t)(slash - local_base);
+                     if (hlen >= sizeof base_only) { free(txt); return NULL; }
+                     memcpy(base_only, local_base, hlen); base_only[hlen] = 0;
+                     snprintf(hpfx, sizeof hpfx, "%s", slash); }
+        else { snprintf(base_only, sizeof base_only, "%s", local_base); hpfx[0] = 0; }
+        char cpath[640]; snprintf(cpath, sizeof cpath, "%s/chat/completions", hpfx);
+        status = mp_http_post_json_raw(base_only, cpath, txt, &resp, &rlen);
     } else {
         static const char kDefaultHost[] = "integrate.api.nvidia.com";
         const char *host = (broker_host && *broker_host) ? broker_host : kDefaultHost;
         char path[256];
-        snprintf(path, sizeof path, "/%s/v1/chat/completions", host);
+        /* Broker routing convention: client POSTs "/<upstream-host><upstream-path>"
+         * (absolute-form URI to the broker adds the 127.0.0.1:port netloc). The
+         * upstream path must come from the provider's base_url (e.g. /v1/chat/
+         * completions for NVIDIA/OpenAI), NOT be hardcoded per host. */
+        snprintf(path, sizeof path, "/%s%s", host, g_upstream_path[0] ? g_upstream_path : "/v1/chat/completions");
         status = mp_broker_post(path, txt, strlen(txt), &resp, &rlen);
     }
     free(txt);

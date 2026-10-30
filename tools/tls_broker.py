@@ -20,7 +20,9 @@ ALLOWED_HOSTS = set(
         "integrate.api.nvidia.com,api.openai.com,api.anthropic.com").split(",") if h.strip())
 KEY_ENV = {"integrate.api.nvidia.com": "NVIDIA_API_KEY",
            "api.openai.com": "OPENAI_API_KEY",
-           "api.anthropic.com": "ANTHROPIC_API_KEY"}
+           "api.anthropic.com": "ANTHROPIC_API_KEY",
+           "backend.lmstudio.ai": "LMSTUDIO_API_KEY",
+           "api.lmstudio.ai": "LMSTUDIO_API_KEY"}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -49,9 +51,13 @@ class Handler(BaseHTTPRequestHandler):
                 path = q.path
             else:
                 path = p
-            parts = path.lstrip("/").split("/", 1)
-            host = parts[0].split(":")[0] if parts else ""
-            upath = "/" + (parts[1] if len(parts) > 1 else "")
+            # C client sends "/<host>/<upstream path>"; the absolute-form URI
+            # also carries a port we must drop from the host but keep nowhere
+            # else. Accept an optional leading "/host" or ":port"-suffixed first
+            # segment; strip it, then forward to https://host<upath>.
+            rest = path.lstrip("/")
+            host = rest.split("/", 1)[0].split(":")[0]
+            upath = "/" + rest.split("/", 1)[1] if "/" in rest else "/"
             if host not in ALLOWED_HOSTS:
                 return self._reply(403, json.dumps({"error": "host not allowed", "got": host}).encode())
             # Client may name the env var holding its key (X-Minipi-Key-Env).
@@ -67,12 +73,43 @@ class Handler(BaseHTTPRequestHandler):
                 key = os.environ.get(known)
             if not key:
                 return self._reply(500, b'{"error":"broker missing api key env"}')
+            # LM Studio's local server is plain HTTP on a LAN/dev host; allow it
+            # only when explicitly added to the allow-list. Everything else TLS.
+            if host.endswith(".lmstudio.ai") or host.endswith(".lmstudio.local"):
+                url = "http://" + host + upath
+                ctx = None
+            else:
+                url = "https://" + host + upath
+                ctx = ssl.create_default_context()
             req = urllib.request.Request(
-                "https://" + host + upath, data=raw, method="POST",
+                url, data=raw, method="POST",
                 headers={"Content-Type": "application/json",
                          "Accept": "text/event-stream",
                          "Authorization": "Bearer " + key})
             with urllib.request.urlopen(req, timeout=300,
+                                        context=ctx) as r:
+                self._reply(r.status, r.read())
+        except urllib.error.HTTPError as e:
+            self._reply(e.code, e.read())
+        except Exception as e:
+            self._reply(502, json.dumps({"error": type(e).__name__}).encode())
+
+
+    def do_GET(self):
+        try:
+            p = self.path
+            if p.startswith("http://127.0.0.1") or p.startswith("http://localhost"):
+                q = urllib.parse.urlparse(p); path = q.path
+            else:
+                path = p
+            rest = path.lstrip("/")
+            host = rest.split("/", 1)[0].split(":")[0]
+            upath = "/" + rest.split("/", 1)[1] if "/" in rest else "/"
+            if host not in ALLOWED_HOSTS:
+                return self._reply(403, json.dumps({"error": "host not allowed", "got": host}).encode())
+            req = urllib.request.Request("https://" + host + upath, method="GET",
+                                         headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=60,
                                         context=ssl.create_default_context()) as r:
                 self._reply(r.status, r.read())
         except urllib.error.HTTPError as e:

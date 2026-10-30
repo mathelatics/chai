@@ -56,15 +56,15 @@ int main(int argc, char **argv) {
 
     /* Load config first: it seeds active provider/model/policy from
      * ~/.minipi/config.toml plus built-in defaults (nemotron pre-registered). */
-    mp_config cfg;
-    mp_cfg_load(&cfg, NULL);
-    if (model_override && cfg.active[0]) {
-        mp_provider *p = mp_cfg_active(&cfg);
-        if (p) snprintf(cfg.session_model, sizeof cfg.session_model, "%s", model_override);
-        else snprintf(p->model, sizeof p->model, "%s", model_override);
+    extern mp_config g_cfg;   /* process-wide config shared with REPL + loop routing */
+    mp_cfg_load(&g_cfg, NULL);
+    mp_config *cfg = &g_cfg;
+    if (model_override && cfg->active[0]) {
+        mp_provider *p = mp_cfg_active(cfg);
+        if (p) snprintf(cfg->session_model, sizeof cfg->session_model, "%s", model_override);
     }
-    if (!have_policy_flag && cfg.policy_mode[0])
-        mp_mode_parse(cfg.policy_mode, &pmode);
+    if (!have_policy_flag && cfg->policy_mode[0])
+        mp_mode_parse(cfg->policy_mode, &pmode);
 
     /* Loud session-dir diagnostics: a wrong/missing $HOME used to silently drop
      * all persistence (the rc=1 mystery). Now we print exactly where it goes. */
@@ -82,9 +82,9 @@ int main(int argc, char **argv) {
     }
 
     mp_bus *bus = mp_bus_new();
-    mp_agent_cfg acfg = { .model = cfg.active[0] ? (cfg.session_model[0] ? cfg.session_model : mp_cfg_active(&cfg)->model)
+    mp_agent_cfg acfg = { .model = cfg->active[0] ? (cfg->session_model[0] ? cfg->session_model : mp_cfg_active(cfg)->model)
                                                   : "offline-stub",
-                          .max_turns = cfg.max_turns ? cfg.max_turns : 8,
+                          .max_turns = cfg->max_turns ? cfg->max_turns : 8,
                           .token_budget = budget };
     (void)budget; (void)pmode;
     mp_agent *agent = mp_agent_new(&acfg, bus);
