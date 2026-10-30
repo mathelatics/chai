@@ -12,6 +12,7 @@ mp_agent *mp_agent_new(const mp_agent_cfg *cfg, mp_bus *bus){
     return a; }
 void mp_agent_free(mp_agent *a){ if(!a)return; mp_ctx_free(&a->ctx); mp_toolreg_free(a->tools); free(a); }
 mp_ctx *mp_agent_ctx(mp_agent *a){ return &a->ctx; }
+mp_toolreg *mp_agent_tools(mp_agent *a){ return a?a->tools:NULL; }
 mp_bus *mp_agent_bus(mp_agent *a){ return a?a->bus:NULL; }
 int mp_agent_run_turn(mp_agent *a, const char *user_text){
     if(!a||!user_text)return -1;

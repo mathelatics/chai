@@ -12,5 +12,9 @@ void      mp_agent_free(mp_agent *a);
  * Returns 0 ok, nonzero error code. */
 int  mp_agent_run_turn(mp_agent *a, const char *user_text);
 mp_ctx *mp_agent_ctx(mp_agent *a);
+struct mp_toolreg; struct mp_toolreg *mp_agent_tools(mp_agent *a);
+/* Interactive REPL against the streaming provider (broker-backed). */
+int mp_repl_run(mp_agent *agent, const char *model, int thinking, long max_tokens,
+                const char *session_dir);
 struct mp_bus; struct mp_bus *mp_agent_bus(mp_agent *a);
 #endif

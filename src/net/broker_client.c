@@ -27,10 +27,13 @@ int mp_broker_post(const char *path, const char *body, size_t body_len,
     int port = (p && *p) ? atoi(p) : 8777;
     int fd = connect_local(port);
     if (fd < 0) return -1;
+    /* Absolute-form URI: broker's handler parses netloc as the upstream host. */
+    char uri[512];
+    snprintf(uri, sizeof uri, "http://127.0.0.1:%d%s", port, path);
     char hdr[1024];
     int hl = snprintf(hdr, sizeof hdr,
         "POST %s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nContent-Type: application/json"
-        "\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", path, port, body_len);
+        "\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", uri, port, body_len);
     if (hl < 0 || (size_t)hl >= sizeof hdr) { close(fd); return -1; }
     if (write(fd, hdr, hl) != hl) { close(fd); return -1; }
     size_t off = 0;

@@ -12,7 +12,8 @@
 #include <sys/stat.h>
 typedef struct { char model[128]; char base_url[512]; long token_budget; int max_turns; } minipi_cfg;
 static int load_config(minipi_cfg *c, const char *path) {
-    strcpy(c->model, "gpt-4o-mini"); c->base_url[0] = 0;
+    strcpy(c->model, "nvidia/nemotron-3.5-lightning-30b-a3b"); c->base_url[0] = 0;
+    { const char *em = getenv("MINIPI_MODEL"); if (em && *em) snprintf(c->model, sizeof c->model, "%s", em); }
     c->token_budget = 120000; c->max_turns = 8;
     char cfgpath[4096];
     if (path && *path) snprintf(cfgpath, sizeof cfgpath, "%s", path);
@@ -73,7 +74,7 @@ int main(int argc, char **argv) {
     mkdir(sessdir, 0700);
     if (oneshot) {
         /* NVIDIA live path: route through broker + SSE streaming. Key comes ONLY
-         * from env (NVIDIA_API_KEY is read by tools/tls_broker.py, never here). */
+         * from the broker's env (NVIDIA_API_KEY), never stored in this binary. */
         mp_ctx *ctx = mp_agent_ctx(a);
         mp_ctx_push(ctx, "user", oneshot, NULL);
         mp_reply *r = mp_nemotron_stream(c.model, ctx, thinking, 16384, 1.0, 0.95,
@@ -86,9 +87,10 @@ int main(int argc, char **argv) {
         mp_agent_free(a); mp_bus_free(bus);
         return 0;
     }
-    mp_tui *tui = mp_tui_new(isatty(0));
-    int rc = mp_tui_run(tui, a);
+    /* Interactive REPL against the live streaming provider (pure C). */
+    int rc = mp_repl_run(a, c.model, thinking, 16384, sessdir);
     mp_compact_if_needed(mp_agent_ctx(a), c.token_budget);
-    mp_tui_free(tui); mp_agent_free(a); mp_bus_free(bus);
+    mp_tui_free(NULL); /* legacy TUI unused in REPL mode */
+    mp_agent_free(a); mp_bus_free(bus);
     return rc;
 }
