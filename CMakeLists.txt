@@ -20,6 +20,7 @@ add_library(minipi_core STATIC
   src/util/sha256.c
   src/util/base64.c
   src/util/uuid.c
+  src/util/paths.c
   src/util/utf8.c
   src/util/diff.c
   src/util/schema.c
@@ -42,6 +43,8 @@ add_library(minipi_core STATIC
   src/mcp/client.c
   src/net/broker_client.c
   src/net/tls_broker.c
+  src/config/config.c
+  src/security/policy.c
   src/providers/nemotron.c
   src/tui/app.c
   src/tui/repl.c
@@ -62,3 +65,9 @@ add_test(NAME smoke_deps COMMAND smoke_deps)
 add_executable(test_minipi tests/test_minipi.c)
 target_link_libraries(test_minipi PRIVATE minipi_core)
 add_test(NAME unit_tests COMMAND test_minipi)
+
+# --- minipi-broker: pure-C TLS boundary (replaces tools/tls_broker.py) ------
+# Separate executable so the MIT-only core never links OpenSSL.
+find_package(OpenSSL REQUIRED)
+add_executable(minipi-broker src/net/tls_broker_main.c)
+target_link_libraries(minipi-broker PRIVATE OpenSSL::SSL OpenSSL::Crypto)
