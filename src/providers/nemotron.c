@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 /* Upstream path derived from provider base_url (e.g. /v1/chat/completions).
  * Set by complete_routed() before each cloud call; empty -> default NVIDIA. */
@@ -64,6 +65,11 @@ static void on_sse_event(const char *event, const char *data, void *p) {
             gbuf_add(&s->reasoning, rs, rs ? strlen(rs) : 0);
             gbuf_add(&s->content, cs, cs ? strlen(cs) : 0);
             /* role-only / empty deltas first — don't print those */
+            /* NVIDIA thinking models return content:null on non-stream calls
+             * while emitting only reasoning_content; surface reasoning as the
+             * visible answer when nothing else exists, so callers never get an
+             * empty reply. */
+            if (!has_text && rs && !cs) { cs = rs; has_text = 1; }
             if (has_text && s->cb) s->cb(rs, cs, s->ud);
             const cJSON *tcs = cJSON_GetObjectItemCaseSensitive(delta, "tool_calls");
             if (cJSON_IsArray(tcs)) {
@@ -204,13 +210,33 @@ static mp_reply *finish(sctx *s) {
 }
 
 static mp_reply *run_parsed(char *resp, size_t rlen, sctx *s) {
-    /* Two wire shapes arrive here:
+    /* Three wire shapes can arrive here:
      *  - SSE stream: lines like "data: {...}" / "data: [DONE]"
      *  - non-streaming: one raw JSON object starting with '{'
-     * Detect by sniffing the first non-whitespace byte; feeding raw JSON to the
-     * SSE line parser would silently drop it (no "data:" prefix). */
+     *  - chunked-framed body that survived decoding with leading framing
+     *    residue (hex size lines / blank lines). Skip whitespace AND short
+     *    hex-chunk-size lines until the first real payload byte; then sniff:
+     *    '{' -> single JSON object, otherwise feed the SSE line parser.
+     * Feeding raw JSON to the SSE parser would silently drop it (no "data:"),
+     * and feeding SSE to a plain cJSON parse fails — hence the sniff. */
     size_t i = 0;
-    while (i < rlen && (resp[i] == ' ' || resp[i] == '\t' || resp[i] == '\r' || resp[i] == '\n')) i++;
+    for (;;) {
+        while (i < rlen && (resp[i]==' '||resp[i]=='\t'||resp[i]=='\r'||resp[i]=='\n')) i++;
+        if (i >= rlen) break;
+        /* possible chunk-size line: all hex chars up to CRLF/LF, len<16 */
+        size_t j = i; int hexrun = 0;
+        while (j < rlen && isxdigit((unsigned char)resp[j]) && hexrun < 16) { j++; hexrun++; }
+        if (hexrun > 0 && hexrun < 16 && j < rlen && (resp[j]=='\r'||resp[j]=='\n')) {
+            /* only treat as framing residue if the line contains NO other bytes
+               after the size (i.e. it is not itself JSON-ish payload start) */
+            size_t k = j;
+            while (k < rlen && (resp[k]=='\r'||resp[k]=='\n')) k++;
+            if (k < rlen && (resp[k]=='{' || resp[k]=='d')) { i = k; continue; } /* skip residue */
+            if (resp[k]!='{') { i = k; continue; }
+            i = k; continue;
+        }
+        break;
+    }
     if (i < rlen && resp[i] == '{') {
         on_sse_event("", resp + i, s);
     } else {
@@ -249,6 +275,10 @@ mp_reply *mp_nemotron_stream_ex(const char *model, const mp_ctx *ctx,
         if (b) {
             cJSON *st = cJSON_GetObjectItemCaseSensitive(b, "stream");
             if (st) cJSON_ReplaceItemInObjectCaseSensitive(b, "stream", cJSON_CreateBool(0));
+            /* reasoning-only models (nemotron thinking) can spend the whole
+             * budget on reasoning_content and return content:null — give them
+             * room so a final answer actually arrives. */
+            cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(b, "max_tokens"), 8192);
             free(txt); txt = cJSON_PrintUnformatted(b); cJSON_Delete(b);
         }
     }
