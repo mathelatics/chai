@@ -213,7 +213,60 @@ static void t_paths(void){
     printf("paths ok\n");
 }
 
+/* C-1: streaming sanitizer — split-across-chunk multibyte, ANSI stripping,
+ * control-byte removal. Acceptance per chai/docs/PLAN.md. */
+static void t_sanitizer(void){
+    mp_utf8_san s; char out[256]; size_t used;
+
+    /* 1) 3-byte UTF-8 (é = E9) split across three chunks -> passes through whole */
+    mp_utf8_san_init(&s); used=0;
+    const unsigned char e_acute[] = {0xC3,0xA9};
+    assert(mp_utf8_sanitize(&s,(char*)e_acute,1,out,sizeof out,&used)==0 && used==0);   /* lead carried */
+    size_t u2=0; assert(mp_utf8_sanitize(&s,(char*)e_acute+1,1,out,sizeof out,&u2)==0);
+    assert(u2==2 && !memcmp(out,"\xC3\xA9",2));                                          /* completed */
+    assert(used==0); /* first call wrote nothing */
+
+    /* 2) CSI escape split across chunks is fully stripped */
+    mp_utf8_san_init(&s); used=0;
+    assert(mp_utf8_sanitize(&s,"\x1B[3",3,out,sizeof out,&used)==0 && used==0);
+    size_t before=used;
+    assert(mp_utf8_sanitize(&s,"1mhi\x07",5,out,sizeof out,&used)==0);
+    (void)before;
+    assert(used==2 && !memcmp(out,"hi",2));
+
+    /* 3) OSC ... BEL stripped, control chars dropped, \n and \t kept */
+    mp_utf8_san_init(&s); used=0;
+    const char in3[] = "\x1B]0;title\x07a\x00b\x07c\nd\te\x7F";
+    assert(sizeof in3 - 1 == 17);
+    assert(mp_utf8_sanitize(&s,in3,17,out,sizeof out,&used)==0);
+    /* OSC stripped; NUL/BEL/DEL dropped; \n and \t kept */
+    assert(used==7 && !memcmp(out,"abc\nd\te",7));
+
+    /* 4) invalid lead byte -> U+FFFD; truncated-at-EOS partial -> flush emits FFFD */
+    mp_utf8_san_init(&s); used=0;
+    assert(mp_utf8_sanitize(&s,"\xFF""x",2,out,sizeof out,&used)==0);
+    assert(used==4 && !memcmp(out,"\xEF\xBF\xBD""x",4));
+    used=0;
+    assert(mp_utf8_sanitize(&s,"\xE2\x82",2,out,sizeof out,&used)==0 && used==0); /* pending */
+    mp_utf8_flush(&s,out,sizeof out,&used);
+    assert(used==3 && !memcmp(out,"\xEF\xBF\xBD",3));                              /* dangling -> FFFD */
+
+    /* 5) dangling ESC at end is dropped on flush */
+    mp_utf8_san_init(&s); used=0;
+    assert(mp_utf8_sanitize(&s,"ok\x1B[",4,out,sizeof out,&used)==0);
+    mp_utf8_flush(&s,out,sizeof out,&used);
+    assert(used==2 && !memcmp(out,"ok",2));
+
+    /* 6) no raw control bytes other than \n\t ever leave the sanitizer */
+    mp_utf8_san_init(&s); used=0;
+    const char nasty[] = "\x01\x02ESC:\x1B[1;31mRED\x1B\x5D\x07\x0B\x0C\x1B(B\x1BM";
+    assert(mp_utf8_sanitize(&s,nasty,sizeof nasty-1,out,sizeof out,&used)==0);
+    for(size_t i=0;i<used;i++) assert(out[i]>=0x20 || out[i]=='\n' || out[i]=='\t' || (unsigned char)out[i]>=0x80);
+    printf("sanitizer ok\n");
+}
+
 int main(void){ t_sha256();t_b64();t_uuid();t_utf8();t_diff();t_schema();
+    t_sanitizer();
     t_arena();t_sse();t_tree();t_compact();t_tools();
     fprintf(stderr,"[step] paths\n"); fflush(stderr); t_paths();
     fprintf(stderr,"[step] store\n"); fflush(stderr); t_store();
