@@ -5,6 +5,7 @@
  * Keys never touch this process — providers store env-var NAMES only; values
  * live in .env exported to the broker. */
 #include "tui/app.h"
+#include "tui/disp.h"
 #include "agent/loop.h"
 #include "providers/provider.h"
 #include "tools/registry.h"
@@ -21,6 +22,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <ctype.h>
+#include <stdint.h>
 
 mp_config g_cfg;
 static mp_policy *g_policy = NULL;
@@ -30,10 +32,11 @@ static mp_store *g_store = NULL;
 
 typedef struct { int thinking; } rctx;
 static void on_delta(const char *reasoning, const char *content, void *p) {
-    rctx *rc = p;
-    if (rc->thinking && reasoning && *reasoning) fputs(reasoning, stdout);
-    if (content && *content) fputs(content, stdout);
-    fflush(stdout);
+    (void)p;
+    /* C-1: every streamed byte goes through the sanitizer; reasoning is a
+     * separate dimmed stream from the answer. */
+    if (reasoning && *reasoning) mp_disp_write(MP_DISP_REASONING, reasoning, SIZE_MAX);
+    if (content && *content)    mp_disp_write(MP_DISP_ANSWER, content, SIZE_MAX);
 }
 
 /* Host part of a cloud base_url for broker path encoding. */
@@ -75,7 +78,9 @@ static mp_reply *complete_with_tools(mp_ctx *ctx, mp_toolreg *tools) {
     mp_reply *r = mp_nemotron_stream_ex(model, ctx, g_thinking, g_max_tokens, 0.2, 0.95,
                                         on_delta, &rc, schemas, local_base, broker_host);
     if (schemas) cJSON_Delete(schemas);
-    printf("\n");
+    /* terminate both streams cleanly (flush partial multibyte, final newline) */
+    mp_disp_end(MP_DISP_REASONING);
+    mp_disp_end(MP_DISP_ANSWER);
     return r;
 }
 
@@ -198,7 +203,7 @@ static int handle_slash(char *line, mp_agent *agent) {
                "every tool call asks for permission (y/a/n/d); HIGH-risk is flagged.\n");
         return 0;
     }
-    if (!strcmp(argv[0], "/thinking")) { g_thinking = !g_thinking; printf("thinking: %s\n", g_thinking ? "on" : "off"); return 0; }
+    if (!strcmp(argv[0], "/thinking")) { g_thinking = !g_thinking; mp_disp_set_reasoning_enabled(g_thinking); printf("thinking: %s\n", g_thinking ? "on" : "off"); return 0; }
     if (!strcmp(argv[0], "/quit") || !strcmp(argv[0], "/exit")) return 1;
     printf("unknown command %s (try /help)\n", argv[0]);
     return 0;
@@ -282,7 +287,13 @@ static int repl_turn(mp_agent *agent, const char *text) {
                 }
                 char *res = mp_tool_execute(tools, name, aj);
                 mp_event rev = {MP_EV_TOOL_RESULT, res, NULL}; mp_bus_emit(bus, &rev);
-                printf("[tool %s] %s\n", name, res ? res : "(error)");
+                {   /* echo tool output through the sanitizer (C-1) */
+                    char hdr[128];
+                    int hl = snprintf(hdr, sizeof hdr, "[tool %s] ", name);
+                    mp_disp_write(MP_DISP_TOOL_OUT, hdr, (size_t)hl);
+                    mp_disp_write(MP_DISP_TOOL_OUT, res ? res : "(error)", SIZE_MAX);
+                    mp_disp_end(MP_DISP_TOOL_OUT);
+                }
                 cJSON *idwrap = cJSON_CreateObject();
                 cJSON_AddStringToObject(idwrap, "id", tcid);
                 mp_ctx_push(mp_agent_ctx(agent), "assistant", "", cJSON_Duplicate(tc, 1));
@@ -310,6 +321,7 @@ static int repl_turn(mp_agent *agent, const char *text) {
 int mp_repl_run(mp_agent *agent, const char *model, int thinking, long max_tokens,
                 const char *session_dir) {
     g_thinking = thinking;
+    mp_disp_set_reasoning_enabled(thinking);
     g_max_tokens = max_tokens > 0 ? max_tokens : 16384;
     mp_cfg_load(&g_cfg, NULL);
     if (model && *model) snprintf(g_cfg.session_model, sizeof g_cfg.session_model, "%s", model);

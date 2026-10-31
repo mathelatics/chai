@@ -48,6 +48,7 @@ add_library(minipi_core STATIC
   src/providers/nemotron.c
   src/tui/app.c
   src/tui/repl.c
+  src/tui/disp.c
   src/tui/render.c
 )
 target_include_directories(minipi_core PUBLIC src)
