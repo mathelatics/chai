@@ -23,31 +23,35 @@ static void usage(const char *argv0) {
     fprintf(stderr,
         "usage: %s [--thinking] [--prompt TEXT] [--json] [--auto-approve] [--model NAME]\n"
         "             [--max-tokens N] [--budget N] [--root DIR] [--resume FILE.jsonl]\n"
-        "             [--policy ask|auto-read|full-auto]\n"
+        "             [--policy ask|auto-read|full-auto] [--tui | --repl]\n"
         "  default: interactive REPL (streaming + thinking off).\n"
         "  --thinking     show reasoning stream (nemotron delta.reasoning_content)\n"
         "  --prompt TEXT  one-shot mode; FAILS CLOSED: tools need --auto-approve\n"
         "  --json         with --prompt: emit JSONL event stream on stdout\n"
         "  --auto-approve full-auto policy for one-shot (HIGH risk still blocked)\n"
+        "  --tui          termbox2 full-screen front-end (headless fallback when no tty)\n"
         "  keys: keep them in .env -> broker env only (see README)\n", argv0);
 }
 
 int main(int argc, char **argv) {
-    int thinking = 0, auto_approve = 0, json_mode = 0;
+    int thinking = 0, auto_approve = 0, json_mode = 0, want_tui = 0;
     const char *prompt = NULL, *model_override = NULL;
     long max_tokens = 16384, budget = 120000;
     const char *resume = NULL;
-    (void)getenv("MINIPI_ROOT"); /* --root handled by REPL/TUI workspace confinement */
+    const char *root_dir = getenv("MINIPI_ROOT"); /* --root overrides below */
     mp_pmode pmode = MP_MODE_ASK_ALWAYS;
     int have_policy_flag = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--thinking")) thinking = 1;
         else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt = argv[++i];
         else if (!strcmp(argv[i], "--json")) json_mode = 1;
+        else if (!strcmp(argv[i], "--tui")) want_tui = 1;
+        else if (!strcmp(argv[i], "--repl")) want_tui = 0;
         else if (!strcmp(argv[i], "--model") && i + 1 < argc) model_override = argv[++i];
         else if (!strcmp(argv[i], "--max-tokens") && i + 1 < argc) max_tokens = atol(argv[++i]);
         else if (!strcmp(argv[i], "--budget") && i + 1 < argc) budget = atol(argv[++i]);
         else if (!strcmp(argv[i], "--resume") && i + 1 < argc) resume = argv[++i];
+        else if (!strcmp(argv[i], "--root") && i + 1 < argc) root_dir = argv[++i];
         else if (!strcmp(argv[i], "--auto-approve")) auto_approve = 1;
         else if (!strcmp(argv[i], "--policy") && i + 1 < argc) {
             if (mp_mode_parse(argv[++i], &pmode)) { fprintf(stderr, "bad --policy\n"); return 2; }
@@ -82,6 +86,11 @@ int main(int argc, char **argv) {
         int v = mp_store_verify(resume);
         if (v != 0) { fprintf(stderr, "refusing to resume %s: integrity check failed (%d)\n", resume, v); return 1; }
     }
+
+    /* Workspace confinement root (--root / $MINIPI_ROOT): the tool registry
+     * canonicalizes every file path against MINIPI_WORKSPACE, so setting it
+     * here makes --root actually confine read/write/edit/bash cwd. */
+    if (root_dir && *root_dir) setenv("MINIPI_WORKSPACE", root_dir, 1);
 
     mp_bus *bus = mp_bus_new();
     mp_agent_cfg acfg = { .model = cfg->active[0] ? (cfg->session_model[0] ? cfg->session_model : mp_cfg_active(cfg)->model)
@@ -121,6 +130,11 @@ int main(int argc, char **argv) {
             }
         }
         mp_policy_free(pol);
+    } else if (want_tui) {
+        /* Full-screen termbox2 front-end (no-op-safe headless fallback). */
+        extern int mp_tui_main(mp_agent *agent, const char *model, int thinking,
+                               long max_tokens, const char *sessdir);
+        rc = mp_tui_main(agent, NULL, thinking, max_tokens, NULL);
     } else {
         rc = mp_repl_run(agent, NULL, thinking, max_tokens, NULL);
     }
