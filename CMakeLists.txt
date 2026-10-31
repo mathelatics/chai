@@ -28,6 +28,7 @@ add_library(minipi_core STATIC
   src/agent/context.c
   src/agent/loop.c
   src/tools/registry.c
+  src/tools/output_cap.c
   src/tools/read.c
   src/tools/write.c
   src/tools/edit.c
@@ -49,6 +50,8 @@ add_library(minipi_core STATIC
   src/tui/app.c
   src/tui/repl.c
   src/tui/disp.c
+  src/tui/input.c
+  src/tui/live.c
   src/tui/render.c
 )
 target_include_directories(minipi_core PUBLIC src)

@@ -117,12 +117,24 @@ char *mp_output_cap(const char *text, size_t len,
             break;
         }
         size_t w = trim_line(v[i].p, v[i].n, max_width, scratch, scratchcap);
-        mp_utf8_san zn; mp_utf8_san_init(&zn);
-        size_t zused = 0;
-        if (mp_utf8_sanitize(&zn, scratch, w, scratch, scratchcap, &zused) == 0) w = zused;
-        size_t fu = 0;
-        if (scratchcap > w) mp_utf8_flush(&zn, scratch + w, scratchcap - w, &fu);
-        w += fu;
+        /* sanitize into a separate buffer: the streaming sanitizer may hold
+         * back trailing bytes of an incomplete codepoint, so in==out would
+         * be unsafe. */
+        static __thread char *zbuf = NULL;
+        static __thread size_t zbuf_cap = 0;
+        if (zbuf_cap < scratchcap) {
+            char *nb = realloc(zbuf, scratchcap);
+            if (nb) { zbuf = nb; zbuf_cap = scratchcap; }
+        }
+        if (zbuf && zbuf_cap >= scratchcap) {
+            mp_utf8_san zn; mp_utf8_san_init(&zn);
+            size_t zused = 0;
+            mp_utf8_sanitize(&zn, scratch, w, zbuf, zbuf_cap, &zused);
+            size_t fu = 0;
+            if (zbuf_cap > zused) mp_utf8_flush(&zn, zbuf + zused, zbuf_cap - zused, &fu);
+            zused += fu;
+            memcpy(scratch, zbuf, zused); w = zused;
+        }
         if (used + w + 1 >= obuf_cap) { EMIT_MARKER(0); break; }
         if (i == keep_head && elided_lines > 0) EMIT_MARKER(0);
         memcpy(obuf + used, scratch, w); used += w; obuf[used++] = '\n';

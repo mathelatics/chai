@@ -21,18 +21,19 @@
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-        "usage: %s [--thinking] [--prompt TEXT] [--auto-approve] [--model NAME]\n"
+        "usage: %s [--thinking] [--prompt TEXT] [--json] [--auto-approve] [--model NAME]\n"
         "             [--max-tokens N] [--budget N] [--root DIR] [--resume FILE.jsonl]\n"
         "             [--policy ask|auto-read|full-auto]\n"
         "  default: interactive REPL (streaming + thinking off).\n"
         "  --thinking     show reasoning stream (nemotron delta.reasoning_content)\n"
         "  --prompt TEXT  one-shot mode; FAILS CLOSED: tools need --auto-approve\n"
+        "  --json         with --prompt: emit JSONL event stream on stdout\n"
         "  --auto-approve full-auto policy for one-shot (HIGH risk still blocked)\n"
         "  keys: keep them in .env -> broker env only (see README)\n", argv0);
 }
 
 int main(int argc, char **argv) {
-    int thinking = 0, auto_approve = 0;
+    int thinking = 0, auto_approve = 0, json_mode = 0;
     const char *prompt = NULL, *model_override = NULL;
     long max_tokens = 16384, budget = 120000;
     const char *resume = NULL;
@@ -42,6 +43,7 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--thinking")) thinking = 1;
         else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt = argv[++i];
+        else if (!strcmp(argv[i], "--json")) json_mode = 1;
         else if (!strcmp(argv[i], "--model") && i + 1 < argc) model_override = argv[++i];
         else if (!strcmp(argv[i], "--max-tokens") && i + 1 < argc) max_tokens = atol(argv[++i]);
         else if (!strcmp(argv[i], "--budget") && i + 1 < argc) budget = atol(argv[++i]);
@@ -97,17 +99,25 @@ int main(int argc, char **argv) {
 
     int rc;
     if (prompt) {
+        /* C-6: --json turns the one-shot run into a JSONL event stream on
+         * stdout (agent_start/user_msg/.../usage/turn_end/agent_end), like pi
+         * coding-agent's headless mode. Human output is suppressed so the
+         * stream stays parseable. */
+        if (json_mode) mp_bus_emit_jsonl(bus, stdout);
+        mp_agent_install_sighandler();   /* C-8: Ctrl-C => stop="aborted" */
         /* One-shot fail-closed path uses the core loop with an approving bus
          * subscriber so nothing runs silently: without --auto-approve any
          * side-effecting tool is DENIED (interactive=0 inside the policy). */
         mp_policy *pol = mp_policy_new(auto_approve ? MP_MODE_FULL_AUTO : pmode, 0);
         rc = mp_agent_run_turn_pol(agent, prompt, pol, tools);
-        /* Print the final assistant message (loop pushes it into ctx). */
-        mp_ctx *cctx = mp_agent_ctx(agent);
-        for (int i = cctx->n - 1; i >= 0; i--) {
-            mp_msg *m = &cctx->v[i];
-            if (m->role && !strcmp(m->role, "assistant") && m->content && *m->content) {
-                fputs(m->content, stdout); fputc('\n', stdout); break;
+        if (!json_mode) {
+            /* Print the final assistant message (loop pushes it into ctx). */
+            mp_ctx *cctx = mp_agent_ctx(agent);
+            for (int i = cctx->n - 1; i >= 0; i--) {
+                mp_msg *m = &cctx->v[i];
+                if (m->role && !strcmp(m->role, "assistant") && m->content && *m->content) {
+                    fputs(m->content, stdout); fputc('\n', stdout); break;
+                }
             }
         }
         mp_policy_free(pol);

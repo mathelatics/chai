@@ -7,6 +7,20 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <signal.h>
+
+/* C-8: cooperative interrupt. SIGINT sets the flag; the loop checks it at
+ * turn boundaries and between tool calls, then reports stop="aborted" —
+ * error-as-data, never a hard exit mid-stream (pi coding-agent behaviour). */
+static volatile sig_atomic_t g_mp_abort = 0;
+void mp_agent_request_abort(void){ g_mp_abort = 1; }
+int  mp_agent_aborted(void){ return g_mp_abort; }
+static void on_sigint(int s){ (void)s; g_mp_abort = 1; }
+void mp_agent_install_sighandler(void){
+    struct sigaction sa; memset(&sa,0,sizeof sa);
+    sa.sa_handler = on_sigint;
+    sigaction(SIGINT,&sa,NULL);
+}
 
 extern mp_config g_cfg;   /* process-wide provider config (defined in tui/repl.c) */
 
@@ -45,6 +59,12 @@ static mp_reply *complete_routed(const char *model, mp_ctx *ctx, mp_toolreg *too
 }
 
 struct mp_agent { mp_agent_cfg cfg; mp_bus *bus; mp_ctx ctx; mp_toolreg *tools; };
+
+/* C-11: naive cost model (USD per million tokens) — replace with per-model
+ * price table when provider metadata lands. */
+static double cost_usd_est(long in_tok, long out_tok){
+    return (in_tok*0.6 + out_tok*2.4)/1e6;   /* ~Nemotron-class pricing */
+}
 
 /* live-route accessors used by the REPL (streaming provider path) */
 const char *mp_agent_model(mp_agent *a){ return a?a->cfg.model:NULL; }
@@ -98,15 +118,27 @@ int mp_agent_run_turn_pol(mp_agent *a, const char *user_text, mp_policy *pol,
                           mp_toolreg *tools){
     if(!a||!user_text)return -1;
     if(!tools)tools=a->tools;
+    g_mp_abort = 0;                       /* fresh turn clears stale interrupt */
+    long tot_in=0, tot_out=0; int turns_used=0; char stop[32]="stop";
+    mp_event as={MP_EV_AGENT_START,user_text,NULL}; mp_bus_emit(a->bus,&as);
     mp_event ev={MP_EV_USER_MSG,user_text,NULL}; mp_bus_emit(a->bus,&ev);
     mp_ctx_push(&a->ctx,"user",user_text,NULL);
     for(int turn=0;turn<(a->cfg.max_turns>0?a->cfg.max_turns:8);turn++){
+        if(g_mp_abort){ snprintf(stop,sizeof stop,"aborted"); break; }
         mp_reply *r=complete_routed(a->cfg.model,&a->ctx,tools);
-        if(!r)return -2;
+        if(!r){ snprintf(stop,sizeof stop,"error"); turns_used++;
+            mp_event er={MP_EV_ERROR,"provider completion failed",NULL}; mp_bus_emit(a->bus,&er);
+            break; }
+        turns_used++;
+        tot_in+=r->input_tokens; tot_out+=r->output_tokens;
+        mp_usage u={r->input_tokens,r->output_tokens,cost_usd_est(r->input_tokens,r->output_tokens)};
+        mp_event uev={MP_EV_USAGE,NULL,&u}; mp_bus_emit(a->bus,&uev);
         mp_event d={MP_EV_ASSISTANT_DELTA,r->text,NULL}; mp_bus_emit(a->bus,&d);
+        if(r->stop_reason[0]) snprintf(stop,sizeof stop,"%s",r->stop_reason);
         if(r->tool_calls){
             const cJSON *tc=NULL;
             cJSON_ArrayForEach(tc,r->tool_calls){
+                if(g_mp_abort){ snprintf(stop,sizeof stop,"aborted"); break; }
                 const cJSON*n=call_name(tc); const cJSON*args=call_args(tc);
                 const char *name=(n&&cJSON_IsString(n))?n->valuestring:"";
                 mp_event tcev={MP_EV_TOOL_CALL,name,args};
@@ -136,8 +168,13 @@ int mp_agent_run_turn_pol(mp_agent *a, const char *user_text, mp_policy *pol,
         mp_ctx_push(&a->ctx,"assistant",r->text?r->text:"",NULL);
         mp_event dn={MP_EV_ASSISTANT_DONE,r->text,NULL}; mp_bus_emit(a->bus,&dn);
         int done=!r->tool_calls; mp_reply_free(r);
-        if(done)break;
+        if(done||g_mp_abort)break;
     }
+    if(g_mp_abort) snprintf(stop,sizeof stop,"aborted");
     mp_event te={MP_EV_TURN_END,NULL,NULL}; mp_bus_emit(a->bus,&te);
+    mp_run_stats st; memset(&st,0,sizeof st);
+    st.input_tokens=tot_in; st.output_tokens=tot_out; st.turns=turns_used;
+    snprintf(st.stop,sizeof st.stop,"%s",stop);
+    mp_event ae={MP_EV_AGENT_END,stop,&st}; mp_bus_emit(a->bus,&ae);
     return 0;
 }
