@@ -234,12 +234,14 @@ static void t_sanitizer(void){
     (void)before;
     assert(used==2 && !memcmp(out,"hi",2));
 
-    /* 3) OSC ... BEL stripped, control chars dropped, \n and \t kept */
+    /* 3) OSC ... BEL stripped, control chars dropped, \n and \t kept.
+     * ESC-']' enters the string-sequence state (per ECMA-48, ']' is OSC, not
+     * an Fe escape), so "0;title" is consumed up to the terminating BEL;
+     * NUL / bare-BEL-in-text / DEL are then dropped; \n and \t are kept. */
     mp_utf8_san_init(&s); used=0;
     const char in3[] = "\x1B]0;title\x07a\x00b\x07c\nd\te\x7F";
     assert(sizeof in3 - 1 == 17);
     assert(mp_utf8_sanitize(&s,in3,17,out,sizeof out,&used)==0);
-    /* OSC stripped; NUL/BEL/DEL dropped; \n and \t kept */
     assert(used==7 && !memcmp(out,"abc\nd\te",7));
 
     /* 4) invalid lead byte -> U+FFFD; truncated-at-EOS partial -> flush emits FFFD */
