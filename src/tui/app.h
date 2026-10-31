@@ -1,9 +1,19 @@
 #ifndef MINIPI_TUI_APP_H
 #define MINIPI_TUI_APP_H
-/* TUI front-end (termbox2) + headless fallback for pipes/CI. */
+/* TUI front-end entry point. --tui runs the same event-driven REPL core over
+ * a tty (raw-mode editor + live region + sanitized streaming); when stdout is
+ * not a tty it degrades gracefully to piped-line mode, so CI and pipes keep
+ * working. The interactive core lives in repl.c; this header is the wiring
+ * surface used by main.c. */
 #include "agent/loop.h"
-typedef struct mp_tui mp_tui;
-mp_tui *mp_tui_new(int want_alt_screen);   /* 0 => headless line REPL on stdin */
-int     mp_tui_run(mp_tui *t, struct mp_agent *agent); /* drives turns until quit */
-void    mp_tui_free(mp_tui *t);
+
+/* Defined in repl.c: the shared interactive driver (also the default path). */
+int mp_repl_run(mp_agent *agent, const char *model, int thinking, long max_tokens,
+                const char *sessdir);
+
+/* Defined in app.c: full-screen entry for --tui. Delegates to mp_repl_run
+ * (ANSI live-region stack); termbox2 overlay activates via render.c if the
+ * build defines MINIPI_WITH_TERMBOX2. */
+int mp_tui_main(mp_agent *agent, const char *model, int thinking, long max_tokens,
+                const char *sessdir);
 #endif

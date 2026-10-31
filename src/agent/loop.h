@@ -26,6 +26,12 @@ struct mp_bus *mp_agent_bus(mp_agent *a);
 const char *mp_agent_model(mp_agent *a);
 int  mp_agent_max_turns(mp_agent *a);
 long mp_agent_token_budget(mp_agent *a);
+/* C-8 cooperative interrupt: SIGINT (or the editor's Ctrl-C callback) sets a
+ * flag; the turn loop stops at the next boundary and reports stop="aborted"
+ * through MP_EV_AGENT_END — error-as-data, never exit() mid-stream. */
+void mp_agent_request_abort(void);
+int  mp_agent_aborted(void);
+void mp_agent_install_sighandler(void);
 /* Interactive REPL against the streaming provider (broker or local inference).
  * sessdir NULL => $MINIPI_HOME/.minipi/sessions with loud diagnostics. */
 int mp_repl_run(mp_agent *agent, const char *model, int thinking, long max_tokens,

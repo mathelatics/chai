@@ -1,39 +1,14 @@
+/* TUI application entry (--tui). Design decision (chai/docs/PLAN.md C-4):
+ * ONE interactive implementation — repl.c provides the raw-mode UTF-8 editor
+ * with history/tab-completion (input.c), the transient live region with
+ * CSI-2026 synced frames (live.c), sanitizer-guarded stream output (disp.c),
+ * and the policy-gated tool loop with approval prompts. This file is the
+ * single wiring point for --tui and the future termbox2 alt-screen overlay
+ * (render.c), replacing the old dead headless loop that duplicated repl.c. */
 #include "app.h"
-#include "agent/loop.h"
-#include "session/store.h"
-#include "util/utf8.h"
-#include "agent/events.h"
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-struct mp_tui { int alt; mp_store *store; };
-mp_tui *mp_tui_new(int alt) { mp_tui *t = calloc(1, sizeof *t); t->alt = alt; return t; }
-void mp_tui_free(mp_tui *t) { if (!t) return; if (t->store) mp_store_close(t->store); free(t); }
-/* Headless loop: read lines from stdin, run agent turn, print events. */
-static void print_cb(const mp_event *ev, void *ud) {
-    (void)ud;
-    switch (ev->kind) {
-    case MP_EV_ASSISTANT_DELTA: printf("assistant: %s\n", ev->text ? ev->text : ""); break;
-    case MP_EV_TOOL_CALL:       printf("[tool] %s\n", ev->text ? ev->text : "?"); break;
-    case MP_EV_TOOL_RESULT:     printf("[result] %.400s\n", ev->text ? ev->text : "(null)"); break;
-    default: break;
-    }
-    fflush(stdout);
-}
-int mp_tui_run(mp_tui *t, mp_agent *agent) {
-    mp_bus *bus = NULL; /* bus lives in agent; subscribe via accessor below */
-    extern mp_bus *mp_agent_bus(mp_agent *a);
-    bus = mp_agent_bus(agent);
-    mp_bus_subscribe(bus, print_cb, NULL);
-    char line[8192];
-    fputs("minipi (offline stub provider). Ctrl-D or /quit to exit.\n", stdout);
-    while (fgets(line, sizeof line, stdin)) {
-        size_t n = strlen(line);
-        while (n && (line[n-1] == '\n' || line[n-1] == '\r')) line[--n] = '\0';
-        if (!n) continue;
-        if (!mp_utf8_valid(line, n)) { puts("error: invalid UTF-8 input"); continue; }
-        if (!strcmp(line, "/quit") || !strcmp(line, "/exit")) break;
-        if (mp_agent_run_turn(agent, line)) { puts("error: turn failed"); break; }
-    }
-    return 0;
+
+int mp_tui_main(mp_agent *agent, const char *model, int thinking, long max_tokens,
+                const char *sessdir) {
+    return mp_repl_run(agent, model, thinking, max_tokens, sessdir);
 }
