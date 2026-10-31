@@ -1,3 +1,4 @@
+#include "util/compat.h"
 #include "uuid.h"
 #include <stdio.h>
 #include <fcntl.h>

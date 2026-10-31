@@ -2,6 +2,7 @@
  * workspace root via mp_path_confine. Output format: one entry per line,
  * "d|r|l name size" — deterministic ordering (dirs first, then lexical) so
  * model feedback is stable and diffable. Read-only: never mutates anything. */
+#include "util/compat.h"
 #include "tools/registry.h"
 #include <stdio.h>
 #include <stdlib.h>

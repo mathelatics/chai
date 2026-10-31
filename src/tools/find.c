@@ -3,6 +3,7 @@
  * against the basename. Skips .git/node_modules/__pycache__, never follows
  * symlinks for directory descent; bounded depth and result count so it always
  * terminates on huge trees. Read-only. */
+#include "util/compat.h"
 #include "tools/registry.h"
 #include <stdio.h>
 #include <stdlib.h>

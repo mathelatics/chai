@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 /* Raw-socket HTTP/1.1 POST to the localhost TLS broker. No TLS here. */
+#include "util/compat.h"
 #include "broker_client.h"
 #include <stdio.h>
 #include <stdlib.h>

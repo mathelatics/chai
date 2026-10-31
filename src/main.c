@@ -7,6 +7,7 @@
  * All management (connect provider, pick model, permission mode) happens in
  * the REPL/TUI; every tool call is gated by security/policy before execution. */
 #define _GNU_SOURCE
+#include "util/compat.h"
 #include "agent/loop.h"
 #include "tui/app.h"
 #include "tools/registry.h"

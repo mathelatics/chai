@@ -1,3 +1,4 @@
+#include "util/compat.h"
 #include "client.h"
 #include <stdio.h>
 #include <stdlib.h>

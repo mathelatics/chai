@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include "util/compat.h"
 /* Transient live-region renderer (C-3). Single-threaded; called from the REPL
  * between provider deltas. No termbox dependency: plain VT100 on a tty, and a
  * no-op fallback when stdout is redirected (keeps pipes/CI clean). */

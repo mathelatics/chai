@@ -1,3 +1,4 @@
+#include "util/compat.h"
 #include "http.h"
 #include "log.h"
 #include <stdlib.h>
