@@ -256,14 +256,6 @@ static mp_reply *run_parsed(char *resp, size_t rlen, sctx *s) {
     return finish(s);
 }
 
-mp_reply *mp_nemotron_stream(const char *model, const mp_ctx *ctx,
-                             int enable_thinking, long max_tokens, double temperature,
-                             double top_p, mp_stream_fn on_delta, void *ud) {
-    mp_nemotron_set_upstream_path("/v1");
-    return mp_nemotron_stream_ex(model, ctx, enable_thinking, max_tokens, temperature,
-                                 top_p, on_delta, ud, NULL, NULL, 0);
-}
-
 /* Extended entry used by the REPL/provider router:
  *  tools:      registry schema array (may be NULL)
  *  local_base: "http://127.0.0.1:PORT/v1" for openai-local providers, else NULL

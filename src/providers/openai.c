@@ -1,4 +1,6 @@
 #include "providers/provider.h"
+#include <stdlib.h>
+#include <string.h>
 /* OpenAI chat-completions wire format helpers (request build + response parse).
  * Transport arrives in M2 (net/http + SSE). Kept pure-JSON here for unit tests. */
 cJSON *mp_openai_build_request(const mp_ctx *ctx, const char *model, int stream) {

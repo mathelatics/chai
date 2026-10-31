@@ -8,6 +8,7 @@
  * the REPL/TUI; every tool call is gated by security/policy before execution. */
 #define _GNU_SOURCE
 #include "agent/loop.h"
+#include "tui/app.h"
 #include "tools/registry.h"
 #include "session/store.h"
 #include "security/policy.h"
@@ -97,10 +98,9 @@ int main(int argc, char **argv) {
                                                   : "offline-stub",
                           .max_turns = cfg->max_turns ? cfg->max_turns : 8,
                           .token_budget = budget };
-    (void)budget; (void)pmode;
     mp_agent *agent = mp_agent_new(&acfg, bus);
-    mp_toolreg *tools = mp_agent_tools(agent);
     if (!agent) { fprintf(stderr, "agent init failed\n"); return 1; }
+    mp_toolreg *tools = mp_agent_tools(agent);
     if (resume) {
         mp_ctx *ctx = mp_agent_ctx(agent);
         if (mp_store_replay(resume, ctx) < 0) { fprintf(stderr, "resume replay failed\n"); return 1; }
@@ -131,9 +131,7 @@ int main(int argc, char **argv) {
         }
         mp_policy_free(pol);
     } else if (want_tui) {
-        /* Full-screen termbox2 front-end (no-op-safe headless fallback). */
-        extern int mp_tui_main(mp_agent *agent, const char *model, int thinking,
-                               long max_tokens, const char *sessdir);
+        /* Full-screen front-end entry (ANSI live-region stack; headless-safe). */
         rc = mp_tui_main(agent, NULL, thinking, max_tokens, NULL);
     } else {
         rc = mp_repl_run(agent, NULL, thinking, max_tokens, NULL);

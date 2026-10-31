@@ -10,6 +10,8 @@
 #include "session/tree.h"
 #include "session/compact.h"
 #include "tools/registry.h"
+#include "tools/output_cap.h"
+#include "agent/events.h"
 #include "session/store.h"
 #include "security/policy.h"
 #include "config/config.h"
@@ -269,9 +271,97 @@ static void t_sanitizer(void){
     printf("sanitizer ok\n");
 }
 
+
+/* ---- C-2: tool output capping -------------------------------------------- */
+static void t_output_cap(void){
+    char *o = mp_output_cap("hello\nworld", 11, 1024, 800, 400);
+    assert(o && !strcmp(o, "hello\nworld")); free(o);
+    size_t n = 300000; char *big = malloc(n+1); memset(big,'x',n); big[n]=0;
+    o = mp_output_cap(big, n, 65536, 800, 400);
+    assert(o);
+    assert(strstr(o, "elided by minipi output cap"));
+    assert(strlen(o) < n);
+    free(o); free(big);
+    static char buf[100000]; size_t off=0;
+    for(int i=0;i<5000;i++) off += (size_t)snprintf(buf+off,sizeof buf-off,"line %d\n",i);
+    o = mp_output_cap(buf, off, 65536, 10, 400);
+    assert(o);
+    assert(strstr(o,"line 0"));                                    /* head kept */
+    assert(strstr(o,"line 4999"));                                 /* tail kept */
+    assert(!strstr(o,"line 2500"));                                /* middle gone */
+    assert(strstr(o, "elided"));
+    free(o);
+    printf("output_cap ok\n");
+}
+
+/* ---- ls/find/grep tools --------------------------------------------------- */
+static void t_search_tools(void){
+    setenv("MINIPI_WORKSPACE","/tmp",1);
+    char dir[256]; snprintf(dir,sizeof dir,"/tmp/minipi-tools-%d",(int)getpid());
+    char cmd[512]; snprintf(cmd,sizeof cmd,"rm -rf %s && mkdir -p %s/sub",dir,dir);
+    if(system(cmd)!=0){ printf("setup failed\n"); return; }
+    char p[512]; FILE*f;
+    snprintf(p,sizeof p,"%s/hello.txt",dir); f=fopen(p,"w"); fputs("needle in haystack\nnot this\nNeedle Case\n",f); fclose(f);
+    snprintf(p,sizeof p,"%s/sub/deep.py",dir); f=fopen(p,"w"); fputs("x=1 # needle\n",f); fclose(f);
+    mp_toolreg *r = mp_toolreg_default();
+    cJSON *args; char *out; char jp[400];
+    /* ls sees both entries */
+    snprintf(jp,sizeof jp,"{\"path\":\"minipi-tools-%d\"}",(int)getpid());
+    args=cJSON_Parse(jp);
+    out=mp_tool_execute(r,"ls",args); assert(out&&strstr(out,"hello.txt")&&strstr(out,"sub")); free(out);
+    cJSON_Delete(args);
+    /* find matches basename glob anywhere below root */
+    snprintf(jp,sizeof jp,"{\"pattern\":\"*.py\",\"root\":\"minipi-tools-%d\"}",(int)getpid());
+    args=cJSON_Parse(jp);
+    out=mp_tool_execute(r,"find",args); assert(out&&strstr(out,"deep.py")); free(out);
+    cJSON_Delete(args);
+    /* grep literal, relative path:lineno: format */
+    snprintf(jp,sizeof jp,"{\"pattern\":\"needle\",\"root\":\"minipi-tools-%d\"}",(int)getpid());
+    args=cJSON_Parse(jp);
+    out=mp_tool_execute(r,"grep",args); assert(out&&strstr(out,"hello.txt:1:")&&strstr(out,"sub/deep.py:1:")); free(out);
+    cJSON_Delete(args);
+    /* grep regex + ignore_case */
+    snprintf(jp,sizeof jp,"{\"pattern\":\"NEEDLE [A-Z]+\",\"root\":\"minipi-tools-%d\",\"ignore_case\":true}",(int)getpid());
+    args=cJSON_Parse(jp);
+    out=mp_tool_execute(r,"grep",args); assert(out&&strstr(out,"Case")); free(out);
+    cJSON_Delete(args);
+    /* confinement: absolute escape rejected */
+    args=cJSON_Parse("{\"pattern\":\"passwd\",\"root\":\"/etc\"}");
+    out=mp_tool_execute(r,"grep",args); assert(out&&strstr(out,"error")); free(out);
+    cJSON_Delete(args);
+    mp_toolreg_free(r);
+    snprintf(cmd,sizeof cmd,"rm -rf %s",dir); if(system(cmd)){}
+    printf("search tools ok\n");
+}
+
+/* ---- C-6: JSONL event stream serialization -------------------------------- */
+static void t_events_jsonl(void){
+    mp_bus *b = mp_bus_new();
+    char path[256]; snprintf(path,sizeof path,"/tmp/minipi-jsonl-%d.log",(int)getpid());
+    FILE *f = fopen(path,"w"); assert(f);
+    mp_bus_emit_jsonl(b,f);
+    mp_usage u = {10, 4, 0.0};
+    mp_event e1 = {MP_EV_USER_MSG, "hi there", NULL}; mp_bus_emit(b,&e1);
+    mp_event e2 = {MP_EV_USAGE, NULL, &u}; mp_bus_emit(b,&e2);
+    mp_run_stats st; st.input_tokens=10; st.output_tokens=4; st.turns=1; strcpy(st.stop,"stop");
+    mp_event e3 = {MP_EV_AGENT_END, "stop", &st}; mp_bus_emit(b,&e3);
+    fclose(f);
+    char *buf = calloc(1, 65536); size_t rd = 0;
+    f = fopen(path,"r"); rd = fread(buf,1,65535,f); fclose(f); buf[rd]=0;
+    assert(strstr(buf,"\"event\":\"user_msg\"") && strstr(buf,"\"text\":\"hi there\""));
+    assert(strstr(buf,"\"input_tokens\":10"));
+    assert(strstr(buf,"\"stop\":\"stop\""));
+    remove(path); free(buf);
+    mp_bus_free(b);
+    printf("events jsonl ok\n");
+}
+
 int main(void){ t_sha256();t_b64();t_uuid();t_utf8();t_diff();t_schema();
     t_sanitizer();
     t_arena();t_sse();t_tree();t_compact();t_tools();
+    fprintf(stderr,"[step] output_cap\n"); fflush(stderr); t_output_cap();
+    fprintf(stderr,"[step] search_tools\n"); fflush(stderr); t_search_tools();
+    fprintf(stderr,"[step] events_jsonl\n"); fflush(stderr); t_events_jsonl();
     fprintf(stderr,"[step] paths\n"); fflush(stderr); t_paths();
     fprintf(stderr,"[step] store\n"); fflush(stderr); t_store();
     fprintf(stderr,"[step] policy\n"); fflush(stderr); t_policy();

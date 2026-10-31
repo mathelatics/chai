@@ -30,6 +30,9 @@ add_library(minipi_core STATIC
   src/tools/registry.c
   src/tools/output_cap.c
   src/tools/read.c
+  src/tools/ls.c
+  src/tools/find.c
+  src/tools/grep.c
   src/tools/write.c
   src/tools/edit.c
   src/tools/bash.c
