@@ -43,10 +43,13 @@ static int esc_feed(mp_utf8_san *s, unsigned char c){
         return 0;
     case 1: /* after ESC */
         if(c=='['){ s->esc=2; return 1; }
-        if(c=='P'||c=='X'||c=='^'||c==']'){ s->esc=4; s->osc_term=0; return 1; } /* sos/osc/pm/apc */
+        /* DCS(P) / SOS(X) / PM(^) / OSC(]) are string sequences: consume all
+         * bytes until BEL or ST (ECMA-48 treats ']' as OSC, not Fe). */
+        if(c=='P'||c=='X'||c=='^'||c==']'){ s->esc=4; s->osc_term=0; return 1; }
         if(c=='\\'){ s->esc=0; return 1; }                    /* ST terminates escape */
-        if((c>='@'&&c<='_')||(c>='f'&&c<='n')||c=='\''||c=='('||c==')'||c=='-'||c=='.'){
-            s->esc = (c=='('||c==')'||c=='-'||c=='.') ? 5 : 0; return 1; } /* charset: one more byte */
+        if((c>='@'&&c<'_')||(c>='f'&&c<='n')||c=='\''){       /* remaining Fe escapes */
+            s->esc=0; return 1; }
+        if(c=='('||c==')'||c=='-'||c=='.'){ s->esc=5; return 1; } /* charset: one more byte */
         s->esc=0; return 1; /* unknown: swallow ESC+c */
     case 2: /* CSI parameter bytes 0x30-0x3F */
         if(c>=0x30&&c<=0x3F) return 1;

@@ -138,7 +138,9 @@ mp_risk mp_policy_scan(const char *text, const char **cat) {
 }
 
 int mp_policy_tool_is_readonly(const char *tool_name) {
-    return tool_name && (!strcmp(tool_name, "read"));
+    /* read-only file-inspection tools: no side effects, safe for auto-read */
+    return tool_name && (!strcmp(tool_name, "read") || !strcmp(tool_name, "ls") ||
+                         !strcmp(tool_name, "find") || !strcmp(tool_name, "grep"));
 }
 
 /* ---- policy object ------------------------------------------------------- */

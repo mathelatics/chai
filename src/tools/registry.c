@@ -1,4 +1,5 @@
 #include "registry.h"
+#include "tools/output_cap.h"
 #include "util/schema.h"
 #include "util/utf8.h"
 #include "khash.h"
@@ -13,7 +14,10 @@ typedef struct { char *name; cJSON *schema; mp_tool_fn fn; void *ud; } tool_ent;
 struct mp_toolreg { tool_ent *v; int n, cap; khash_t(toolmap) *idx; };
 extern char *mp_tool_read(const cJSON*,void*); extern char *mp_tool_write(const cJSON*,void*);
 extern char *mp_tool_edit(const cJSON*,void*); extern char *mp_tool_bash(const cJSON*,void*);
+extern char *mp_tool_ls(const cJSON*,void*); extern char *mp_tool_find(const cJSON*,void*);
+extern char *mp_tool_grep(const cJSON*,void*);
 extern const char *MP_SCHEMA_READ, *MP_SCHEMA_WRITE, *MP_SCHEMA_EDIT, *MP_SCHEMA_BASH;
+extern const char *MP_SCHEMA_LS, *MP_SCHEMA_FIND, *MP_SCHEMA_GREP;
 static char *dupz(const char *s){ size_t n=strlen(s)+1; char*b=malloc(n); if(b)memcpy(b,s,n); return b; }
 mp_toolreg *mp_toolreg_new_(void){
     mp_toolreg *r=calloc(1,sizeof*r); r->idx=kh_init(toolmap); return r; }
@@ -42,7 +46,12 @@ char *mp_tool_execute(mp_toolreg *r,const char*name,const cJSON*args){
     const cJSON *it=NULL;
     cJSON_ArrayForEach(it,args) if(cJSON_IsString(it)&&!mp_utf8_valid(it->valuestring,strlen(it->valuestring)))
         return strdup("error: invalid UTF-8 in arguments");
-    return e->fn(args,e->ud);
+    char *raw = e->fn(args,e->ud);
+    /* C-2: cap tool output BEFORE it re-enters model context (head+tail keep,
+     * explicit elision marker). NULL-safe: on alloc failure keep raw. */
+    if (raw) { char *capped = mp_output_cap(raw, strlen(raw), 0, 0, 0);
+               if (capped) { free(raw); return capped; } }
+    return raw;
 }
 cJSON *mp_toolreg_schemas(const mp_toolreg *r){
     cJSON *arr=cJSON_CreateArray();
@@ -69,6 +78,9 @@ mp_toolreg *mp_toolreg_default(void){
     if(!root){ if(!getcwd(wsbuf,sizeof wsbuf))strcpy(wsbuf,"."); root=wsbuf; }
     char *rootc=dupz(root);
     mp_toolreg_add(r,"read",cJSON_Parse(MP_SCHEMA_READ),(mp_tool_fn)mp_tool_read,rootc);
+    mp_toolreg_add(r,"ls",cJSON_Parse(MP_SCHEMA_LS),mp_tool_ls,rootc);
+    mp_toolreg_add(r,"find",cJSON_Parse(MP_SCHEMA_FIND),mp_tool_find,rootc);
+    mp_toolreg_add(r,"grep",cJSON_Parse(MP_SCHEMA_GREP),mp_tool_grep,rootc);
     mp_toolreg_add(r,"write",cJSON_Parse(MP_SCHEMA_WRITE),mp_tool_write,rootc);
     mp_toolreg_add(r,"edit",cJSON_Parse(MP_SCHEMA_EDIT),mp_tool_edit,rootc);
     mp_toolreg_add(r,"bash",cJSON_Parse(MP_SCHEMA_BASH),mp_tool_bash,rootc);

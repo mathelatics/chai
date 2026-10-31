@@ -8,6 +8,7 @@
  * the REPL/TUI; every tool call is gated by security/policy before execution. */
 #define _GNU_SOURCE
 #include "agent/loop.h"
+#include "tui/app.h"
 #include "tools/registry.h"
 #include "session/store.h"
 #include "security/policy.h"
@@ -21,31 +22,37 @@
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-        "usage: %s [--thinking] [--prompt TEXT] [--auto-approve] [--model NAME]\n"
+        "usage: %s [--thinking] [--prompt TEXT] [--json] [--auto-approve] [--model NAME]\n"
         "             [--max-tokens N] [--budget N] [--root DIR] [--resume FILE.jsonl]\n"
-        "             [--policy ask|auto-read|full-auto]\n"
+        "             [--policy ask|auto-read|full-auto] [--tui | --repl]\n"
         "  default: interactive REPL (streaming + thinking off).\n"
         "  --thinking     show reasoning stream (nemotron delta.reasoning_content)\n"
         "  --prompt TEXT  one-shot mode; FAILS CLOSED: tools need --auto-approve\n"
+        "  --json         with --prompt: emit JSONL event stream on stdout\n"
         "  --auto-approve full-auto policy for one-shot (HIGH risk still blocked)\n"
+        "  --tui          termbox2 full-screen front-end (headless fallback when no tty)\n"
         "  keys: keep them in .env -> broker env only (see README)\n", argv0);
 }
 
 int main(int argc, char **argv) {
-    int thinking = 0, auto_approve = 0;
+    int thinking = 0, auto_approve = 0, json_mode = 0, want_tui = 0;
     const char *prompt = NULL, *model_override = NULL;
     long max_tokens = 16384, budget = 120000;
     const char *resume = NULL;
-    (void)getenv("MINIPI_ROOT"); /* --root handled by REPL/TUI workspace confinement */
+    const char *root_dir = getenv("MINIPI_ROOT"); /* --root overrides below */
     mp_pmode pmode = MP_MODE_ASK_ALWAYS;
     int have_policy_flag = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--thinking")) thinking = 1;
         else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt = argv[++i];
+        else if (!strcmp(argv[i], "--json")) json_mode = 1;
+        else if (!strcmp(argv[i], "--tui")) want_tui = 1;
+        else if (!strcmp(argv[i], "--repl")) want_tui = 0;
         else if (!strcmp(argv[i], "--model") && i + 1 < argc) model_override = argv[++i];
         else if (!strcmp(argv[i], "--max-tokens") && i + 1 < argc) max_tokens = atol(argv[++i]);
         else if (!strcmp(argv[i], "--budget") && i + 1 < argc) budget = atol(argv[++i]);
         else if (!strcmp(argv[i], "--resume") && i + 1 < argc) resume = argv[++i];
+        else if (!strcmp(argv[i], "--root") && i + 1 < argc) root_dir = argv[++i];
         else if (!strcmp(argv[i], "--auto-approve")) auto_approve = 1;
         else if (!strcmp(argv[i], "--policy") && i + 1 < argc) {
             if (mp_mode_parse(argv[++i], &pmode)) { fprintf(stderr, "bad --policy\n"); return 2; }
@@ -81,15 +88,19 @@ int main(int argc, char **argv) {
         if (v != 0) { fprintf(stderr, "refusing to resume %s: integrity check failed (%d)\n", resume, v); return 1; }
     }
 
+    /* Workspace confinement root (--root / $MINIPI_ROOT): the tool registry
+     * canonicalizes every file path against MINIPI_WORKSPACE, so setting it
+     * here makes --root actually confine read/write/edit/bash cwd. */
+    if (root_dir && *root_dir) setenv("MINIPI_WORKSPACE", root_dir, 1);
+
     mp_bus *bus = mp_bus_new();
     mp_agent_cfg acfg = { .model = cfg->active[0] ? (cfg->session_model[0] ? cfg->session_model : mp_cfg_active(cfg)->model)
                                                   : "offline-stub",
                           .max_turns = cfg->max_turns ? cfg->max_turns : 8,
                           .token_budget = budget };
-    (void)budget; (void)pmode;
     mp_agent *agent = mp_agent_new(&acfg, bus);
-    mp_toolreg *tools = mp_agent_tools(agent);
     if (!agent) { fprintf(stderr, "agent init failed\n"); return 1; }
+    mp_toolreg *tools = mp_agent_tools(agent);
     if (resume) {
         mp_ctx *ctx = mp_agent_ctx(agent);
         if (mp_store_replay(resume, ctx) < 0) { fprintf(stderr, "resume replay failed\n"); return 1; }
@@ -97,20 +108,31 @@ int main(int argc, char **argv) {
 
     int rc;
     if (prompt) {
+        /* C-6: --json turns the one-shot run into a JSONL event stream on
+         * stdout (agent_start/user_msg/.../usage/turn_end/agent_end), like pi
+         * coding-agent's headless mode. Human output is suppressed so the
+         * stream stays parseable. */
+        if (json_mode) mp_bus_emit_jsonl(bus, stdout);
+        mp_agent_install_sighandler();   /* C-8: Ctrl-C => stop="aborted" */
         /* One-shot fail-closed path uses the core loop with an approving bus
          * subscriber so nothing runs silently: without --auto-approve any
          * side-effecting tool is DENIED (interactive=0 inside the policy). */
         mp_policy *pol = mp_policy_new(auto_approve ? MP_MODE_FULL_AUTO : pmode, 0);
         rc = mp_agent_run_turn_pol(agent, prompt, pol, tools);
-        /* Print the final assistant message (loop pushes it into ctx). */
-        mp_ctx *cctx = mp_agent_ctx(agent);
-        for (int i = cctx->n - 1; i >= 0; i--) {
-            mp_msg *m = &cctx->v[i];
-            if (m->role && !strcmp(m->role, "assistant") && m->content && *m->content) {
-                fputs(m->content, stdout); fputc('\n', stdout); break;
+        if (!json_mode) {
+            /* Print the final assistant message (loop pushes it into ctx). */
+            mp_ctx *cctx = mp_agent_ctx(agent);
+            for (int i = cctx->n - 1; i >= 0; i--) {
+                mp_msg *m = &cctx->v[i];
+                if (m->role && !strcmp(m->role, "assistant") && m->content && *m->content) {
+                    fputs(m->content, stdout); fputc('\n', stdout); break;
+                }
             }
         }
         mp_policy_free(pol);
+    } else if (want_tui) {
+        /* Full-screen front-end entry (ANSI live-region stack; headless-safe). */
+        rc = mp_tui_main(agent, NULL, thinking, max_tokens, NULL);
     } else {
         rc = mp_repl_run(agent, NULL, thinking, max_tokens, NULL);
     }

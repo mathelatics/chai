@@ -1,4 +1,6 @@
 #include "providers/provider.h"
+#include <stdlib.h>
+#include <string.h>
 /* Anthropic messages API wire-format helpers (pure JSON; transport in M2). */
 cJSON *mp_anthropic_build_request(const mp_ctx *ctx, const char *model, int stream) {
     cJSON *body = cJSON_CreateObject();

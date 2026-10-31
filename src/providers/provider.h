@@ -6,7 +6,8 @@
 #include "agent/context.h"
 #include "cJSON.h"
 typedef struct { char *text; cJSON *tool_calls /* array of {id,name,arguments} or NULL */;
-                 long input_tokens, output_tokens; } mp_reply;
+                 long input_tokens, output_tokens;
+                 char stop_reason[32]; /* "stop"|"length"|"tool_calls"|"abort"|"" */ } mp_reply;
 mp_reply *mp_provider_complete(const char *model, const mp_ctx *ctx);
 void      mp_reply_free(mp_reply *r);
 /* provider registry (khash in later milestones) */
@@ -14,9 +15,6 @@ int mp_provider_set_base_url(const char *url);   /* dev mode: http:// localhost 
 /* NVIDIA Nemotron streaming variant: parses SSE chunks incl. delta.reasoning_content.
  * Returns reply->text = content, reply->tool_calls may hold parsed tool calls. */
 typedef void (*mp_stream_fn)(const char *reasoning_delta, const char *content_delta, void *ud);
-mp_reply *mp_nemotron_stream(const char *model, const mp_ctx *ctx,
-                             int enable_thinking, long max_tokens, double temperature,
-                             double top_p, mp_stream_fn on_delta, void *ud);
 
 /* Extended streaming entry: routes to the TLS broker (cloud) or directly to a
  * loopback OpenAI-compatible server (local inference). tools is the registry

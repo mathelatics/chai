@@ -40,7 +40,7 @@ static void gbuf_free(gbuf *g) { free(g->buf); g->buf = NULL; g->len = g->cap = 
 #define MAX_TC 16
 typedef struct { char id[64]; char name[128]; gbuf args; int present; } tcslot;
 
-typedef struct { mp_stream_fn cb; void *ud; gbuf content, reasoning; long in_tok, out_tok; tcslot tc[MAX_TC]; } sctx;
+typedef struct { mp_stream_fn cb; void *ud; gbuf content, reasoning; long in_tok, out_tok; tcslot tc[MAX_TC]; char stop[32]; volatile int aborted; } sctx;
 
 static void on_sse_event(const char *event, const char *data, void *p) {
     (void)event;
@@ -92,6 +92,11 @@ static void on_sse_event(const char *event, const char *data, void *p) {
                 }
             }
         }
+    }
+    if (cJSON_IsArray(ch) && ch->child) {
+        const cJSON *fr = cJSON_GetObjectItemCaseSensitive(ch->child, "finish_reason");
+        if (cJSON_IsString(fr) && fr->valuestring[0])
+            snprintf(s->stop, sizeof s->stop, "%s", fr->valuestring);
     }
     const cJSON *use = cJSON_GetObjectItemCaseSensitive(j, "usage");
     if (cJSON_IsObject(use)) {
@@ -204,6 +209,9 @@ static mp_reply *finish(sctx *s) {
     mp_reply *r = calloc(1, sizeof *r);
     r->text = s->content.buf ? s->content.buf : strdup("");
     r->tool_calls = tcarr;
+    if (s->aborted) snprintf(r->stop_reason, sizeof r->stop_reason, "abort");
+    else if (s->stop[0]) snprintf(r->stop_reason, sizeof r->stop_reason, "%s", s->stop);
+    else if (tcarr) snprintf(r->stop_reason, sizeof r->stop_reason, "tool_calls");
     r->input_tokens = s->in_tok; r->output_tokens = s->out_tok;
     gbuf_free(&s->reasoning);
     return r;
@@ -246,14 +254,6 @@ static mp_reply *run_parsed(char *resp, size_t rlen, sctx *s) {
         mp_sse_free(sse);
     }
     return finish(s);
-}
-
-mp_reply *mp_nemotron_stream(const char *model, const mp_ctx *ctx,
-                             int enable_thinking, long max_tokens, double temperature,
-                             double top_p, mp_stream_fn on_delta, void *ud) {
-    mp_nemotron_set_upstream_path("/v1");
-    return mp_nemotron_stream_ex(model, ctx, enable_thinking, max_tokens, temperature,
-                                 top_p, on_delta, ud, NULL, NULL, 0);
 }
 
 /* Extended entry used by the REPL/provider router:

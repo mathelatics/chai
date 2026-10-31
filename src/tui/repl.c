@@ -6,6 +6,8 @@
  * live in .env exported to the broker. */
 #include "tui/app.h"
 #include "tui/disp.h"
+#include "tui/input.h"
+#include "tui/live.h"
 #include "agent/loop.h"
 #include "providers/provider.h"
 #include "tools/registry.h"
@@ -23,12 +25,37 @@
 #include <unistd.h>
 #include <ctype.h>
 #include <stdint.h>
+#include <signal.h>
 
 mp_config g_cfg;
 static mp_policy *g_policy = NULL;
 static int g_thinking = 0;
 static long g_max_tokens = 16384;
 static mp_store *g_store = NULL;
+static mp_editor *g_ed = NULL;         /* C-4 raw-mode line editor */
+static volatile sig_atomic_t g_int_now = 0;   /* SIGINT during a live turn */
+
+/* While the provider streams, SIGINT must not kill the REPL: it flags an
+ * interrupt and we report stop="aborted" (error-as-data, pi behaviour). The
+ * editor installs its own handler only while waiting for input. */
+static void on_turn_sigint(int s){ (void)s; g_int_now = 1; }
+
+/* Read one answer line from the user through the editor (falls back to a
+ * plain fgets when stdin is not a tty — mp_ed_readline handles both). */
+static int ask_line(const char *prompt, char *out, size_t outsz) {
+    if (g_ed) {
+        char *res = NULL;
+        mp_ed_action a = mp_ed_readline(g_ed, prompt, &res);
+        if (a != MP_ED_SUBMIT || !res) { free(res); return -1; }
+        snprintf(out, outsz, "%s", res);
+        free(res);
+        return 0;
+    }
+    fputs(prompt, stdout); fflush(stdout);
+    if (!fgets(out, (int)outsz, stdin)) return -1;
+    out[strcspn(out, "\r\n")] = 0;
+    return 0;
+}
 
 typedef struct { int thinking; } rctx;
 static void on_delta(const char *reasoning, const char *content, void *p) {
@@ -210,24 +237,30 @@ static int handle_slash(char *line, mp_agent *agent) {
 }
 
 /* Ask the human about one pending tool call. Returns verdict after recording.
- * deny_note (if non-NULL buffer) receives the "deny+note" message for the model. */
+ * deny_note (if non-NULL buffer) receives the "deny+note" message for the model.
+ * While a prompt is open we temporarily restore canonical-mode SIGINT handling
+ * (default action): Ctrl-C at the y/a/n/d question cancels the approval and
+ * denies the call, instead of only setting the turn-abort flag. */
 static mp_verdict approve_call(const char *name, const cJSON *args,
                                char *deny_note, size_t dn_sz) {
     mp_risk risk = MP_RISK_NONE; const char *cat = "none";
     char preview[2048];
     mp_verdict v = mp_policy_check(g_policy, name, args, preview, sizeof preview, &risk, &cat);
     if (v != MP_NEED_PROMPT) return v;
+    struct sigaction sa, old; memset(&sa, 0, sizeof sa);
+    sa.sa_handler = SIG_DFL; sigaction(SIGINT, &sa, &old);
     printf("\n\033[33m[%s risk:%s%s] agent wants to run: %s\033[0m\n"
            "  allow? (y)once (a)always-this-tool (n)deny (d)deny+note: ",
            name, mp_risk_name(risk), strcmp(cat,"none") ? cat : "", preview);
     fflush(stdout);
     char ans[128] = "";
-    if (!fgets(ans, sizeof ans, stdin)) { mp_policy_record_answer(g_policy, name, 'n'); return MP_DENY; }
+    int got = ask_line("", ans, sizeof ans);
+    sigaction(SIGINT, &old, NULL);
+    if (got) { mp_policy_record_answer(g_policy, name, 'n'); return MP_DENY; }
     char c = (char)tolower((unsigned char)ans[0]);
     if (c == 'd') {
         char note[512] = "";
-        printf("  note to model: "); fflush(stdout);
-        if (fgets(note, sizeof note, stdin)) note[strcspn(note, "\n")] = 0;
+        if (ask_line("  note to model: ", note, sizeof note) < 0) note[0] = 0;
         mp_policy_record_answer(g_policy, name, 'n');
         if (deny_note && dn_sz)
             snprintf(deny_note, dn_sz, "user denied this action (%s: %s). Reason: %s",
@@ -246,6 +279,9 @@ static mp_verdict approve_call(const char *name, const cJSON *args,
 /* One user turn with tool loop + permission gates. Returns 0 ok. */
 static int repl_turn(mp_agent *agent, const char *text) {
     mp_bus *bus = mp_agent_bus(agent);
+    g_int_now = 0;
+    struct sigaction sa, old; memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_turn_sigint; sigaction(SIGINT, &sa, &old);
     mp_event ev = {MP_EV_USER_MSG, text, NULL}; mp_bus_emit(bus, &ev);
     mp_ctx_push(mp_agent_ctx(agent), "user", text, NULL);
     if (g_store) mp_store_append(g_store, "user", text, NULL, NULL);
@@ -258,19 +294,30 @@ static int repl_turn(mp_agent *agent, const char *text) {
                ucat, mp_risk_name(ur));
 
     mp_toolreg *tools = mp_agent_tools(agent);
-    int rc = 0;
+    int rc = 0; char stop[32] = "stop";
+    long tot_in = 0, tot_out = 0; int turns_used = 0;
     for (int turn = 0; turn < g_cfg.max_turns; turn++) {
+        if (g_int_now) { snprintf(stop, sizeof stop, "aborted"); break; }  /* C-8 */
+        mp_live_update(turn ? "continuing…" : "thinking…");                /* C-3 */
         mp_reply *r = complete_with_tools(mp_agent_ctx(agent), tools);
-        if (!r) { rc = -2; break; }
+        if (!r) { mp_live_stop(); fprintf(stderr, "[provider] completion failed (transport or HTTP error)\n");
+                  snprintf(stop, sizeof stop, "error"); rc = -2; break; }
+        turns_used++;
+        /* C-5/C-6: per-turn token accounting through the event spine */
+        tot_in += r->input_tokens; tot_out += r->output_tokens;
+        mp_usage u = { r->input_tokens, r->output_tokens, 0.0 };
+        mp_event uev = {MP_EV_USAGE, NULL, &u}; mp_bus_emit(bus, &uev);
         if (r->tool_calls) {
             const cJSON *tc = NULL;
             cJSON_ArrayForEach(tc, r->tool_calls) {
+                if (g_int_now) { snprintf(stop, sizeof stop, "aborted"); break; }
                 const cJSON *nj = cJSON_GetObjectItemCaseSensitive(tc, "name");
                 const cJSON *aj = cJSON_GetObjectItemCaseSensitive(tc, "arguments");
                 const char *name = cJSON_IsString(nj) ? nj->valuestring : "";
                 const cJSON *idj = cJSON_GetObjectItemCaseSensitive(tc, "id");
                 char tcid[80]; snprintf(tcid, sizeof tcid, "%s", cJSON_IsString(idj) ? idj->valuestring : "call_0");
                 mp_event tcev = {MP_EV_TOOL_CALL, name, aj}; mp_bus_emit(bus, &tcev);
+                mp_live_update("awaiting approval");   /* prompt goes above live region */
                 char denybuf[768] = "";
                 mp_verdict v = approve_call(name, aj, denybuf, sizeof denybuf);
                 if (v == MP_DENY) {
@@ -285,6 +332,8 @@ static int repl_turn(mp_agent *agent, const char *text) {
                     if (g_store) mp_store_append(g_store, "denial", name, NULL, NULL);
                     continue;
                 }
+                char live[96]; snprintf(live, sizeof live, "running %s…", name);
+                mp_live_update(name && *name ? live : "running tool…");
                 char *res = mp_tool_execute(tools, name, aj);
                 mp_event rev = {MP_EV_TOOL_RESULT, res, NULL}; mp_bus_emit(bus, &rev);
                 {   /* echo tool output through the sanitizer (C-1) */
@@ -306,15 +355,29 @@ static int repl_turn(mp_agent *agent, const char *text) {
             mp_ctx_push(mp_agent_ctx(agent), "assistant", r->text ? r->text : "", NULL);
             if (g_store) mp_store_append(g_store, "assistant", r->text ? r->text : "", NULL, NULL);
             mp_event dn = {MP_EV_ASSISTANT_DONE, r->text, NULL}; mp_bus_emit(bus, &dn);
+            if (r->stop_reason[0]) snprintf(stop, sizeof stop, "%s", r->stop_reason);
             mp_reply_free(r);
             break;
         }
         mp_event dn = {MP_EV_ASSISTANT_DONE, r->text, NULL}; mp_bus_emit(bus, &dn);
+        if (r->stop_reason[0]) snprintf(stop, sizeof stop, "%s", r->stop_reason);
         mp_reply_free(r);
     }
     mp_compact_if_needed(mp_agent_ctx(agent), g_cfg.token_budget);
     if (g_store) mp_store_checkpoint(g_store);
     mp_event te = {MP_EV_TURN_END, NULL, NULL}; mp_bus_emit(bus, &te);
+    mp_run_stats st; memset(&st, 0, sizeof st);
+    st.input_tokens = tot_in; st.output_tokens = tot_out; st.turns = turns_used;
+    snprintf(st.stop, sizeof st.stop, "%s", stop);
+    mp_event ae = {MP_EV_AGENT_END, stop, &st}; mp_bus_emit(bus, &ae);
+    if (mp_live_active()) {
+        char fin[96]; snprintf(fin, sizeof fin, "done (%d turn%s, +%ld in / +%ld tok) [%s]",
+                               turns_used, turns_used == 1 ? "" : "s", tot_in, tot_out, stop);
+        mp_live_update(fin);
+        mp_live_tick();
+        mp_live_stop();
+    }
+    sigaction(SIGINT, &old, NULL);
     return rc;
 }
 
@@ -347,22 +410,36 @@ int mp_repl_run(mp_agent *agent, const char *model, int thinking, long max_token
         else fprintf(stderr, "[session] NOT persisted (see log_error above)\n");
     }
 
+    /* C-4: raw-mode line editor with history (falls back to plain reads on
+     * pipes). History lives next to the sessions under ~/.minipi. */
+    {
+        char hf[4096];
+        const char *base = mp_minipi_dir();
+        if (base) snprintf(hf, sizeof hf, "%s/history", base);
+        else hf[0] = 0;
+        g_ed = mp_ed_new(hf[0] ? hf : NULL);
+    }
+
     printf("mini-pi REPL — broker at %s | provider=%s model=%s | policy=%s\n"
            "type /help, then anything else goes to the model. Ctrl-D quits.\n",
            mp_broker_url(), g_cfg.active,
            g_cfg.session_model[0] ? g_cfg.session_model : (mp_cfg_active(&g_cfg) ? mp_cfg_active(&g_cfg)->model : "?"),
            mp_mode_name(mp_policy_mode(g_policy)));
-    char line[8192];
     int quit = 0;
-    while (!quit) {
-        printf("> "); fflush(stdout);
-        if (!fgets(line, sizeof line, stdin)) break;
-        size_t l = strlen(line);
-        while (l && (line[l-1] == '\n' || line[l-1] == '\r')) line[--l] = 0;
-        if (!l) continue;
-        if (line[0] == '/') { quit = handle_slash(line, agent); continue; }
+    for (;;) {
+        char *line = NULL;
+        mp_ed_action a = g_ed ? mp_ed_readline(g_ed, "> ", &line)
+                              : (fgets(line = calloc(1, 8192), 8192, stdin)
+                                 ? (line[strcspn(line, "\r\n")] = 0, MP_ED_SUBMIT) : MP_ED_QUIT);
+        if (a == MP_ED_QUIT) { free(line); break; }
+        if (a == MP_ED_INTERRUPT) { free(line); continue; }   /* idle ^C: just clear */
+        if (!line || !*line) { free(line); continue; }
+        if (g_ed) mp_ed_hist_add(g_ed, line);
+        if (line[0] == '/') { quit = handle_slash(line, agent); free(line); if (quit) break; continue; }
         repl_turn(agent, line);
+        free(line);
     }
+    if (g_ed) { mp_ed_hist_save(g_ed); mp_ed_free(g_ed); g_ed = NULL; }
     if (g_store) { mp_store_checkpoint(g_store); mp_store_close(g_store); g_store = NULL; }
     mp_policy_free(g_policy); g_policy = NULL;
     return 0;
