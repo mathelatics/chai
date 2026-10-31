@@ -1,4 +1,5 @@
 #include "registry.h"
+#include "tools/output_cap.h"
 #include "util/schema.h"
 #include "util/utf8.h"
 #include "khash.h"
@@ -42,7 +43,12 @@ char *mp_tool_execute(mp_toolreg *r,const char*name,const cJSON*args){
     const cJSON *it=NULL;
     cJSON_ArrayForEach(it,args) if(cJSON_IsString(it)&&!mp_utf8_valid(it->valuestring,strlen(it->valuestring)))
         return strdup("error: invalid UTF-8 in arguments");
-    return e->fn(args,e->ud);
+    char *raw = e->fn(args,e->ud);
+    /* C-2: cap tool output BEFORE it re-enters model context (head+tail keep,
+     * explicit elision marker). NULL-safe: on alloc failure keep raw. */
+    if (raw) { char *capped = mp_output_cap(raw, strlen(raw), 0, 0, 0);
+               if (capped) { free(raw); return capped; } }
+    return raw;
 }
 cJSON *mp_toolreg_schemas(const mp_toolreg *r){
     cJSON *arr=cJSON_CreateArray();

@@ -6,7 +6,8 @@
 #include "agent/context.h"
 #include "cJSON.h"
 typedef struct { char *text; cJSON *tool_calls /* array of {id,name,arguments} or NULL */;
-                 long input_tokens, output_tokens; } mp_reply;
+                 long input_tokens, output_tokens;
+                 char stop_reason[32]; /* "stop"|"length"|"tool_calls"|"abort"|"" */ } mp_reply;
 mp_reply *mp_provider_complete(const char *model, const mp_ctx *ctx);
 void      mp_reply_free(mp_reply *r);
 /* provider registry (khash in later milestones) */

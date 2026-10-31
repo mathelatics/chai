@@ -237,11 +237,13 @@ static void t_sanitizer(void){
     /* 3) OSC ... BEL stripped, control chars dropped, \n and \t kept.
      * ESC-']' enters the string-sequence state (per ECMA-48, ']' is OSC, not
      * an Fe escape), so "0;title" is consumed up to the terminating BEL;
-     * NUL / bare-BEL-in-text / DEL are then dropped; \n and \t are kept. */
+     * NUL / bare-BEL-in-text / DEL are then dropped; \n and \t are kept.
+     * NOTE: use \xNN escapes for every byte adjacent to a hex-looking letter
+     * so C string parsing cannot merge them into one hex escape. */
     mp_utf8_san_init(&s); used=0;
-    const char in3[] = "\x1B]0;title\x07a\x00b\x07c\nd\te\x7F";
-    assert(sizeof in3 - 1 == 17);
-    assert(mp_utf8_sanitize(&s,in3,17,out,sizeof out,&used)==0);
+    const char in3[] = "\x1B]0;title\x07" "a\x00" "b\x07" "c\nd\te\x7F";
+    assert(sizeof in3 - 1 == 20);
+    assert(mp_utf8_sanitize(&s,in3,20,out,sizeof out,&used)==0);
     assert(used==7 && !memcmp(out,"abc\nd\te",7));
 
     /* 4) invalid lead byte -> U+FFFD; truncated-at-EOS partial -> flush emits FFFD */
