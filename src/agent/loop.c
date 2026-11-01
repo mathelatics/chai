@@ -3,7 +3,7 @@
 #include "providers/provider.h"
 #include "security/policy.h"
 #include "config/config.h"
-#include "net/broker_client.h"
+#include "providers/router.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -14,6 +14,7 @@
  * error-as-data, never a hard exit mid-stream (pi coding-agent behaviour). */
 static volatile sig_atomic_t g_mp_abort = 0;
 void mp_agent_request_abort(void){ g_mp_abort = 1; }
+void mp_agent_clear_abort(void){ g_mp_abort = 0; }
 int  mp_agent_aborted(void){ return g_mp_abort; }
 static void on_sigint(int s){ (void)s; g_mp_abort = 1; }
 void mp_agent_install_sighandler(void){
@@ -34,26 +35,7 @@ static mp_reply *complete_routed(const char *model, mp_ctx *ctx, mp_toolreg *too
         return mp_provider_complete(model ? model : "offline-stub", ctx);
     const char *m = g_cfg.session_model[0] ? g_cfg.session_model : prov->model;
     cJSON *schemas = tools ? mp_toolreg_schemas(tools) : NULL;
-    char host[256]; const char *local_base = NULL, *broker_host = NULL;
-    if (prov->kind == MP_KIND_OPENAI_LOCAL) {
-        local_base = prov->base_url;
-    } else {
-        const char *p = strstr(prov->base_url, "://");
-        if (p) {
-            p += 3; const char *e = strchr(p, '/');
-            size_t len = e ? (size_t)(e - p) : strlen(p);
-            if (len && len < sizeof host) { memcpy(host, p, len); host[len] = 0; broker_host = host; }
-        }
-        if (!broker_host) { snprintf(host, sizeof host, "%s", "integrate.api.nvidia.com"); broker_host = host; }
-        /* path component of base_url (e.g. /v1) -> chat/completions appended by nemotron.c */
-        const char *pp = strstr(prov->base_url, "://");
-        if (pp) { pp += 3; const char *sl = strchr(pp, '/');
-                  mp_nemotron_set_upstream_path(sl ? sl : "/v1"); }
-        else mp_nemotron_set_upstream_path("/v1");
-    }
-    mp_broker_set_key_env(prov->key_env[0] ? prov->key_env : "NVIDIA_API_KEY");
-    mp_reply *r = mp_nemotron_stream_ex(m, ctx, 0, 4096, 0.2, 0.95, NULL, NULL,
-                                        schemas, local_base, broker_host);
+    mp_reply *r = mp_provider_stream(prov, m, ctx, 0, 4096, NULL, NULL, schemas);
     if (schemas) cJSON_Delete(schemas);
     return r;
 }
@@ -84,35 +66,6 @@ mp_bus *mp_agent_bus(mp_agent *a){ return a?a->bus:NULL; }
 
 static const cJSON *call_name(const cJSON *tc){ return cJSON_GetObjectItemCaseSensitive(tc,"name"); }
 static const cJSON *call_args(const cJSON *tc){ return cJSON_GetObjectItemCaseSensitive(tc,"arguments"); }
-
-int mp_agent_run_turn(mp_agent *a, const char *user_text){
-    if(!a||!user_text)return -1;
-    mp_event ev={MP_EV_USER_MSG,user_text,NULL}; mp_bus_emit(a->bus,&ev);
-    mp_ctx_push(&a->ctx,"user",user_text,NULL);
-    for(int turn=0;turn<a->cfg.max_turns;turn++){
-        mp_reply *r=complete_routed(a->cfg.model,&a->ctx,a->tools);
-        if(!r)return -2;
-        mp_event d={MP_EV_ASSISTANT_DELTA,r->text,NULL}; mp_bus_emit(a->bus,&d);
-        if(r->tool_calls){
-            const cJSON *tc=NULL;
-            cJSON_ArrayForEach(tc,r->tool_calls){
-                const cJSON*n=call_name(tc); const cJSON*args=call_args(tc);
-                mp_event tcev={MP_EV_TOOL_CALL,n&&cJSON_IsString(n)?n->valuestring:"?",args};
-                mp_bus_emit(a->bus,&tcev);
-                /* No policy supplied => fail closed: refuse to run tools. */
-                const char *msg="[blocked] no permission policy attached; tool was not executed";
-                mp_event rev={MP_EV_TOOL_RESULT,msg,NULL}; mp_bus_emit(a->bus,&rev);
-                mp_ctx_push(&a->ctx,"tool",msg,cJSON_Duplicate(tc,1));
-            }
-        }
-        mp_ctx_push(&a->ctx,"assistant",r->text?r->text:"",NULL);
-        mp_event dn={MP_EV_ASSISTANT_DONE,r->text,NULL}; mp_bus_emit(a->bus,&dn);
-        int done=!r->tool_calls; mp_reply_free(r);
-        if(done)break;
-    }
-    mp_event te={MP_EV_TURN_END,NULL,NULL}; mp_bus_emit(a->bus,&te);
-    return 0;
-}
 
 int mp_agent_run_turn_pol(mp_agent *a, const char *user_text, mp_policy *pol,
                           mp_toolreg *tools){

@@ -12,8 +12,6 @@ typedef struct { const char *model; int max_turns; long token_budget; } mp_agent
 
 mp_agent *mp_agent_new(const mp_agent_cfg *cfg, mp_bus *bus);
 void      mp_agent_free(mp_agent *a);
-/* Runs one user turn to completion (blocking w.r.t. the loop). Returns 0 ok. */
-int  mp_agent_run_turn(mp_agent *a, const char *user_text);
 /* Policy-gated variant used by --prompt one-shot mode: every tool call gets a
  * verdict from `pol` before execution; DENY feeds a denial notice back to the
  * model instead of running anything. */
@@ -30,6 +28,7 @@ long mp_agent_token_budget(mp_agent *a);
  * flag; the turn loop stops at the next boundary and reports stop="aborted"
  * through MP_EV_AGENT_END — error-as-data, never exit() mid-stream. */
 void mp_agent_request_abort(void);
+void mp_agent_clear_abort(void);
 int  mp_agent_aborted(void);
 void mp_agent_install_sighandler(void);
 /* Interactive REPL against the streaming provider (broker or local inference).

@@ -11,6 +11,17 @@
 #include <netinet/in.h>
 #include <netdb.h>
 #include <arpa/inet.h>
+#include <fcntl.h>
+#include <time.h>
+#include <sys/time.h>
+#include <sys/wait.h>
+
+/* Idle I/O timeout: a stalled peer must never hang the agent forever. */
+static void set_io_timeout(int fd, int sec) {
+    struct timeval tv = { sec, 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+}
 
 static int connect_local(int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -19,36 +30,105 @@ static int connect_local(int port) {
     a.sin_family = AF_INET; a.sin_port = htons((unsigned short)port);
     inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
     if (connect(fd, (struct sockaddr *)&a, sizeof a) != 0) { close(fd); return -1; }
+    set_io_timeout(fd, 300); /* LLM streams can pause between tokens */
     return fd;
 }
 
 /* Env-var NAME advertised to the broker via X-Minipi-Key-Env (name only,
  * never the secret). Set by mp_broker_set_key_env() from the REPL/config. */
 static char g_key_env[64];
+static char g_auth[16] = "bearer";
 
 void mp_broker_set_key_env(const char *env_name) {
     if (!env_name || !*env_name) { g_key_env[0] = 0; return; }
     snprintf(g_key_env, sizeof g_key_env, "%s", env_name);
 }
+void mp_broker_set_auth(const char *auth) {
+    snprintf(g_auth, sizeof g_auth, "%s", (auth && *auth) ? auth : "bearer");
+}
 
-int mp_broker_post(const char *path, const char *body, size_t body_len,
-                   char **out, size_t *out_len) {
-    const char *p = getenv("MINIPI_BROKER_PORT"); 
-    int port = (p && *p) ? atoi(p) : 8777;
+static int broker_port(void) {
+    const char *p = getenv("MINIPI_BROKER_PORT");
+    return (p && *p) ? atoi(p) : 8777;
+}
+
+int mp_broker_is_up(void) {
+    int fd = connect_local(broker_port());
+    if (fd < 0) return 0;
+    close(fd);
+    return 1;
+}
+
+int mp_broker_ensure(void) {
+    if (mp_broker_is_up()) return 0;
+    const char *no = getenv("MINIPI_NO_AUTOSTART");
+    if (no && *no && strcmp(no, "0")) return -1;
+    const char *self = getenv("MINIPI_BROKER_BIN");
+    char sibling[4096] = "";
+#ifdef __linux__
+    char exe[4096];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (n > 0) {
+        exe[n] = 0;
+        char *slash = strrchr(exe, '/');
+        if (slash) { *slash = 0; snprintf(sibling, sizeof sibling, "%s/minipi-broker", exe); }
+    }
+#endif
+    const char *cands[4]; int nc = 0;
+    if (self && *self) cands[nc++] = self;
+    if (sibling[0]) cands[nc++] = sibling;
+    cands[nc++] = "build/minipi-broker";
+    cands[nc++] = "minipi-broker";
+
+    for (int i = 0; i < nc; i++) {
+        if (strchr(cands[i], '/') && access(cands[i], X_OK)) continue;
+        pid_t pid = fork();
+        if (pid < 0) return -1;
+        if (pid == 0) {
+            setsid();
+            int nul = open("/dev/null", O_RDWR);
+            if (nul >= 0) { dup2(nul, 0); dup2(nul, 1); dup2(nul, 2); if (nul > 2) close(nul); }
+            if (strchr(cands[i], '/')) execl(cands[i], cands[i], (char *)NULL);
+            else execlp(cands[i], cands[i], (char *)NULL);
+            _exit(127);
+        }
+        /* wait up to ~2s for the listener */
+        for (int t = 0; t < 40; t++) {
+            struct timespec ts = { 0, 50 * 1000 * 1000 };
+            nanosleep(&ts, NULL);
+            if (mp_broker_is_up()) return 0;
+        }
+        int st = 0;
+        if (waitpid(pid, &st, WNOHANG) == pid) { /* exited: try next candidate */ }
+        else break; /* still running but not up yet: give up */
+    }
+    return -1;
+}
+
+int mp_broker_request(const char *method, const char *path,
+                      const char *body, size_t body_len,
+                      const char *auth, const char *key_env,
+                      char **out, size_t *out_len) {
+    int port = broker_port();
     int fd = connect_local(port);
     if (fd < 0) return -1;
+    const char *m = (method && *method) ? method : "POST";
+    const char *ae = (key_env && *key_env) ? key_env : "";
+    const char *as = (auth && *auth) ? auth : "bearer";
     /* Absolute-form URI: broker's handler parses netloc as the upstream host. */
     char uri[512];
     snprintf(uri, sizeof uri, "http://127.0.0.1:%d%s", port, path);
     char hdr[1024];
     int hl = snprintf(hdr, sizeof hdr,
-        "POST %s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nContent-Type: application/json"
-        "\r\nContent-Length: %zu\r\nConnection: close%s%s%s\r\n\r\n", uri, port, body_len,
-        g_key_env[0] ? "\r\nX-Minipi-Key-Env: " : "", g_key_env, "");
+        "%s %s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nContent-Type: application/json"
+        "\r\nContent-Length: %zu\r\nConnection: close%s%s%s%s\r\n\r\n",
+        m, uri, port, body_len,
+        ae[0] ? "\r\nX-Minipi-Key-Env: " : "", ae,
+        ae[0] ? "\r\nX-Minipi-Auth: " : "", ae[0] ? as : "");
     if (hl < 0 || (size_t)hl >= sizeof hdr) { close(fd); return -1; }
     if (write(fd, hdr, hl) != hl) { close(fd); return -1; }
     size_t off = 0;
-    while (off < body_len) {
+    while (body && off < body_len) {
         ssize_t w = write(fd, body + off, body_len - off);
         if (w <= 0) { close(fd); return -1; }
         off += (size_t)w;
@@ -64,6 +144,9 @@ int mp_broker_post(const char *path, const char *body, size_t body_len,
         len += (size_t)r;
     }
     close(fd);
+    /* NUL-terminate for the sscanf/strcspn helpers below. */
+    if (len >= cap) { char *nb = realloc(buf, cap + 1); if (!nb) { free(buf); return -1; } buf = nb; cap++; }
+    buf[len] = 0;
     /* split headers/body at \r\n\r\n */
     char *sep = memmem(buf, len, "\r\n\r\n", 4);
     if (!sep) { free(buf); return -1; }
@@ -126,34 +209,35 @@ identity:
     }
 }
 
+int mp_broker_post(const char *path, const char *body, size_t body_len,
+                   char **out, size_t *out_len) {
+    return mp_broker_request("POST", path, body, body_len, g_auth, g_key_env, out, out_len);
+}
+
 /* ---- loopback HTTP for local inference (LM Studio/Ollama/llama.cpp) ---- */
-static int split_url(const char *url, const char *path, char *hostbuf, size_t hn,
+static int split_url(const char *url, char *hostbuf, size_t hn,
                      int *port, char *uri, size_t un) {
     const char *base = NULL;
     int p = 80;
     if (!strncmp(url, "http://127.0.0.1", 16)) base = "127.0.0.1";
     else if (!strncmp(url, "http://localhost", 16)) base = "localhost";
     else return -2;
-    const char *rest = url + (base[0] == 'l' ? 16 : 16);
-    /* skip past scheme+host prefix length properly */
-    rest = url + strlen("http://") + strlen(base);
+    const char *rest = url + strlen("http://") + strlen(base);
     if (*rest == ':') { p = atoi(rest + 1); while (*rest && *rest != '/') rest++; }
     while (*rest == '/') rest++;
     snprintf(hostbuf, hn, "%s", base);
     *port = p;
-    /* uri = /<remaining-base>/<path> */
-    char tail[512];
-    if (*rest) snprintf(tail, sizeof tail, "/%s", rest); else tail[0] = 0;
-    if (tail[strlen(tail)-1] == '/') tail[strlen(tail)-1] = 0;
-    snprintf(uri, un, "%s%s", tail, path);
+    /* uri = /<remaining>/<path> */
+    if (!*rest) { uri[0] = 0; return 0; }
+    snprintf(uri, un, "/%s", rest);
     return 0;
 }
 
-int mp_local_http(const char *url_base, const char *path, const char *method,
+int mp_local_http(const char *url_base, const char *method,
                   const char *body, size_t body_len, char **out, size_t *out_len) {
-    if (!url_base || !path || !method || !out || !out_len) return -1;
+    if (!url_base || !method || !out || !out_len) return -1;
     char host[64], uri[1024]; int port = 0;
-    if (split_url(url_base, path, host, sizeof host, &port, uri, sizeof uri) < 0) {
+    if (split_url(url_base, host, sizeof host, &port, uri, sizeof uri) < 0) {
         return -2; /* refused: not loopback */
     }
     struct addrinfo hints, *res = NULL;
@@ -165,6 +249,7 @@ int mp_local_http(const char *url_base, const char *path, const char *method,
     if (fd < 0) { freeaddrinfo(res); return -1; }
     if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) { close(fd); freeaddrinfo(res); return -1; }
     freeaddrinfo(res);
+    set_io_timeout(fd, 300);
     char hdr[1024];
     int hl = snprintf(hdr, sizeof hdr,
         "%s %s HTTP/1.1\r\nHost: %s:%d\r\nAccept: application/json\r\n"
@@ -188,6 +273,8 @@ int mp_local_http(const char *url_base, const char *path, const char *method,
         len += (size_t)r;
     }
     close(fd);
+    if (len >= cap) { char *nb = realloc(buf, cap + 1); if (!nb) { free(buf); return -1; } buf = nb; cap++; }
+    buf[len] = 0;
     char *sep = memmem(buf, len, "\r\n\r\n", 4);
     if (!sep) { free(buf); return -1; }
     size_t status_line_len = strcspn(buf, "\r\n");

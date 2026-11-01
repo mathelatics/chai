@@ -1,7 +1,7 @@
 #ifndef MINIPI_AGENT_EVENTS_H
 #define MINIPI_AGENT_EVENTS_H
 /* Agent event bus: providers/tools emit events; TUI and session store consume.
- * Single-threaded core loop (libuv owns I/O threads; callbacks marshal here). */
+ * Single-threaded core loop (callbacks marshal here). */
 typedef enum {
     MP_EV_USER_MSG, MP_EV_ASSISTANT_DELTA, MP_EV_ASSISTANT_DONE,
     MP_EV_TOOL_CALL, MP_EV_TOOL_RESULT, MP_EV_ERROR, MP_EV_TURN_END,

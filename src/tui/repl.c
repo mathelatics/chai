@@ -15,6 +15,8 @@
 #include "session/compact.h"
 #include "security/policy.h"
 #include "config/config.h"
+#include "config/keys.h"
+#include "providers/router.h"
 #include "util/paths.h"
 #include "net/broker_client.h"
 #include "cJSON.h"
@@ -22,10 +24,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <ctype.h>
 #include <stdint.h>
 #include <signal.h>
+#include <termios.h>
 
 mp_config g_cfg;
 static mp_policy *g_policy = NULL;
@@ -66,44 +70,165 @@ static void on_delta(const char *reasoning, const char *content, void *p) {
     if (content && *content)    mp_disp_write(MP_DISP_ANSWER, content, SIZE_MAX);
 }
 
-/* Host part of a cloud base_url for broker path encoding. */
-static int host_of(const char *url, char *out, size_t n) {
-    const char *p = strstr(url, "://");
+/* ---- interactive provider management ----------------------------------- */
+
+/* Cache of the last live model list, so /model <n> can address an entry the
+ * user just saw without re-fetching. */
+static mp_model_list g_models;
+static char g_models_provider[64];
+#define MODELS_SHOWN 60
+
+static void cache_models(const char *provider, const mp_model_list *src) {
+    mp_model_list_free(&g_models);
+    snprintf(g_models_provider, sizeof g_models_provider, "%s", provider ? provider : "");
+    for (int i = 0; i < src->n; i++) {
+        if (g_models.n == g_models.cap) {
+            int nc = g_models.cap ? g_models.cap * 2 : 32;
+            char **nv = realloc(g_models.v, (size_t)nc * sizeof *nv);
+            if (!nv) return;
+            g_models.v = nv; g_models.cap = nc;
+        }
+        g_models.v[g_models.n++] = strdup(src->v[i]);
+    }
+}
+
+/* Read a secret without echo when a tty is available (keys never show up in
+ * terminal history or the process list). */
+static int ask_secret(const char *prompt, char *out, size_t n) {
+    if (!isatty(STDIN_FILENO)) return ask_line(prompt, out, n);
+    struct termios oldt, newt;
+    if (tcgetattr(STDIN_FILENO, &oldt)) return ask_line(prompt, out, n);
+    newt = oldt; newt.c_lflag &= ~(tcflag_t)ECHO;
+    fputs(prompt, stdout); fflush(stdout);
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &newt);
+    int rc = fgets(out, (int)n, stdin) ? 0 : -1;
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &oldt);
+    fputc('\n', stdout);
+    if (rc == 0) out[strcspn(out, "\r\n")] = 0;
+    return rc;
+}
+
+static void print_presets(void) {
+    int n = 0; const mp_preset *p = mp_presets(&n);
+    int idx = 0;
+    printf("cloud providers:\n");
+    for (int i = 0; i < n; i++)
+        if (!p[i].local)
+            printf("  %2d) %-12s %-20s %s\n", ++idx, p[i].id, p[i].label, p[i].base_url);
+    printf("local servers (loopback only, no key):\n");
+    for (int i = 0; i < n; i++)
+        if (p[i].local)
+            printf("  %2d) %-12s %-20s %s\n", ++idx, p[i].id, p[i].label, p[i].base_url);
+}
+
+/* Show the numbered list and let the user pick by index, exact id, unique
+ * substring, or type a raw model id. Returns 1 picked, 0 kept, -1 cancelled. */
+static int pick_model(const mp_model_list *ml, const char *current,
+                      char *out, size_t out_n, int allow_keep) {
+    if (!ml || ml->n == 0) return -1;
+    int shown = ml->n > MODELS_SHOWN ? MODELS_SHOWN : ml->n;
+    for (int i = 0; i < shown; i++) {
+        const char *mark = (current && !strcmp(current, ml->v[i])) ? " *" : "  ";
+        printf("%3d)%s %s\n", i + 1, mark, ml->v[i]);
+    }
+    if (ml->n > shown) printf("  ... %d more; type part of a name to filter/pick\n", ml->n - shown);
+    char ans[512];
+    char prompt[160];
+    snprintf(prompt, sizeof prompt, "select model # or id%s: ", allow_keep ? " (Enter keeps current)" : "");
+    if (ask_line(prompt, ans, sizeof ans)) return -1;
+    if (!*ans) return allow_keep ? 0 : -1;
+    char *end = NULL;
+    long k = strtol(ans, &end, 10);
+    if (end && *end == 0 && k >= 1 && k <= ml->n) {
+        snprintf(out, out_n, "%s", ml->v[k - 1]);
+        return 1;
+    }
+    int match = -1, count = 0;
+    for (int i = 0; i < ml->n; i++)
+        if (!strcasecmp(ml->v[i], ans)) { match = i; count = 1; break; }
+    if (count == 0)
+        for (int i = 0; i < ml->n; i++)
+            if (strcasestr(ml->v[i], ans)) { match = i; count++; }
+    if (count == 1) { snprintf(out, out_n, "%s", ml->v[match]); return 1; }
+    if (count > 1) {
+        printf("ambiguous (%d matches):\n", count);
+        int printed = 0;
+        for (int i = 0; i < ml->n && printed < 20; i++)
+            if (strcasestr(ml->v[i], ans)) { printf("  %s\n", ml->v[i]); printed++; }
+        return -1;
+    }
+    snprintf(out, out_n, "%s", ans); /* accept a raw upstream model id */
+    return 1;
+}
+
+/* Full interactive connect: choose transport details, store the key locally,
+ * then discover + select a model from the provider itself. */
+static int connect_preset(const mp_preset *p) {
     if (!p) return -1;
-    p += 3;
-    const char *e = strchr(p, '/');
-    size_t len = e ? (size_t)(e - p) : strlen(p);
-    if (!len || len >= n) return -1;
-    memcpy(out, p, len); out[len] = '\0';
+    char base[512]; snprintf(base, sizeof base, "%s", p->base_url);
+    char model[192]; snprintf(model, sizeof model, "%s", p->model);
+
+    if (p->local) {
+        char ans[512];
+        printf("[connect] %s — local inference at %s (no API key)\n", p->label, p->base_url);
+        char prompt[600]; snprintf(prompt, sizeof prompt, "base URL [%s]: ", p->base_url);
+        if (ask_line(prompt, ans, sizeof ans) == 0 && *ans) snprintf(base, sizeof base, "%s", ans);
+    } else {
+        char existing[512];
+        int have = mp_keys_lookup(p->key_env, existing, sizeof existing);
+        char key[1024] = "";
+        char prompt[400];
+        snprintf(prompt, sizeof prompt, "API key for %s (%s)%s: ", p->label, p->key_env,
+                 have ? " [already configured — Enter keeps]" : "");
+        if (ask_secret(prompt, key, sizeof key) == 0 && *key) {
+            if (mp_keys_save(p->key_env, key) == 0) {
+                printf("[key] %s stored in %s (mode 0600)\n", p->key_env, mp_keys_env_path());
+                have = 1;
+            } else printf("[key] could not store key; export %s in the broker env instead\n", p->key_env);
+        }
+        if (!have)
+            printf("[warn] no key for %s yet — requests will 401 until you run /connect key %s\n",
+                   p->key_env, p->id);
+        printf("[connect] %s via %s%s\n", p->label, p->base_url,
+               mp_broker_is_up() ? " (broker running)" : " (broker will auto-start)");
+    }
+
+    if (mp_cfg_find(&g_cfg, p->id)) mp_cfg_rm(&g_cfg, p->id);
+    int rc = mp_cfg_add_ex(&g_cfg, p->id, p->kind, base, model, p->key_env, p->auth);
+    if (rc) { printf("[connect] failed (code %d: full/bad kind/bad url)\n", rc); return -1; }
+    mp_cfg_use(&g_cfg, p->id);
+    mp_provider *prov = mp_cfg_active(&g_cfg);
+
+    printf("[connect] fetching available models from %s ...\n", base);
+    mp_model_list ml;
+    if (mp_provider_list_models(prov, &ml) == 0 && ml.n > 0) {
+        printf("%d model%s available:\n", ml.n, ml.n == 1 ? "" : "s");
+        char chosen[192];
+        if (pick_model(&ml, prov->model, chosen, sizeof chosen, 1) > 0) {
+            snprintf(prov->model, sizeof prov->model, "%s", chosen);
+            snprintf(g_cfg.session_model, sizeof g_cfg.session_model, "%s", chosen);
+        }
+        cache_models(prov->name, &ml);
+    } else {
+        printf("[connect] live model list unavailable; keeping default '%s'"
+               " (retry later with /models)\n", prov->model);
+    }
+    mp_model_list_free(&ml);
+    mp_cfg_save(&g_cfg);
+    printf("[connect] active: %s (%s) model: %s\n", prov->name,
+           mp_kind_name(prov->kind),
+           g_cfg.session_model[0] ? g_cfg.session_model : prov->model);
     return 0;
 }
 
 static mp_reply *complete_with_tools(mp_ctx *ctx, mp_toolreg *tools) {
     mp_provider *prov = mp_cfg_active(&g_cfg);
-    if (!prov) { fprintf(stderr, "[no provider connected — use /connect add]\n"); return NULL; }
+    if (!prov) { fprintf(stderr, "[no provider connected — use /connect]\n"); return NULL; }
     const char *model = g_cfg.session_model[0] ? g_cfg.session_model : prov->model;
     cJSON *schemas = tools ? mp_toolreg_schemas(tools) : NULL;
-    char host[256]; const char *local_base = NULL, *broker_host = NULL;
-    char key_hdr[64];
-    snprintf(key_hdr, sizeof key_hdr, "%s",
-             prov->key_env[0] ? prov->key_env : "NVIDIA_API_KEY");
-    if (prov->kind == MP_KIND_OPENAI_LOCAL) {
-        local_base = prov->base_url;   /* loopback enforced deeper too */
-    } else {
-        if (host_of(prov->base_url, host, sizeof host)) {
-            snprintf(host, sizeof host, "%s", "integrate.api.nvidia.com");
-        }
-        broker_host = host;
-        /* path component of base_url (e.g. /v1) -> chat/completions appended by nemotron.c */
-        const char *pp = strstr(prov->base_url, "://");
-        if (pp) { pp += 3; const char *sl = strchr(pp, '/');
-                  mp_nemotron_set_upstream_path(sl ? sl : "/v1"); }
-        else mp_nemotron_set_upstream_path("/v1");
-    }
-    mp_broker_set_key_env(key_hdr);   /* tells broker which env var holds the key */
     rctx rc = { g_thinking };
-    mp_reply *r = mp_nemotron_stream_ex(model, ctx, g_thinking, g_max_tokens, 0.2, 0.95,
-                                        on_delta, &rc, schemas, local_base, broker_host);
+    mp_reply *r = mp_provider_stream(prov, model, ctx, g_thinking, g_max_tokens,
+                                     on_delta, &rc, schemas);
     if (schemas) cJSON_Delete(schemas);
     /* terminate both streams cleanly (flush partial multibyte, final newline) */
     mp_disp_end(MP_DISP_REASONING);
@@ -112,22 +237,36 @@ static mp_reply *complete_with_tools(mp_ctx *ctx, mp_toolreg *tools) {
 }
 
 /* ---- slash commands ------------------------------------------------------ */
+static void print_providers(void) {
+    mp_provider *act = mp_cfg_active(&g_cfg);
+    printf("providers (%d), active: %s\n", g_cfg.n, g_cfg.active[0] ? g_cfg.active : "(none)");
+    for (int i = 0; i < g_cfg.n; i++)
+        printf("  %s%-14s %-13s %s  model=%s  key_env=%s\n",
+               (act == &g_cfg.v[i]) ? "* " : "  ", g_cfg.v[i].name,
+               mp_kind_name(g_cfg.v[i].kind), g_cfg.v[i].base_url, g_cfg.v[i].model,
+               g_cfg.v[i].key_env[0] ? g_cfg.v[i].key_env : "(none)");
+}
+
 static void cmd_connect(int argc, char **argv) {
-    if (argc < 2 || !strcmp(argv[1], "list")) {
-        mp_provider *act = mp_cfg_active(&g_cfg);
-        printf("providers (%d), active: %s\n", g_cfg.n, g_cfg.active[0] ? g_cfg.active : "(none)");
-        for (int i = 0; i < g_cfg.n; i++)
-            printf("  %s%-14s %-13s %s  model=%s  key_env=%s%s\n",
-                   (act == &g_cfg.v[i]) ? "* " : "  ", g_cfg.v[i].name,
-                   mp_kind_name(g_cfg.v[i].kind), g_cfg.v[i].base_url, g_cfg.v[i].model,
-                   g_cfg.v[i].key_env[0] ? g_cfg.v[i].key_env : "(none)", "");
-        if (argc < 2)
-            printf("usage: /connect list | add <name> <kind> <base_url> <model> [KEY_ENV_NAME]"
-                   " | rm <name> | use <name>\n"
-                   "  kinds: nemotron | openai | anthropic | openai-local (LM Studio/Ollama/llama.cpp)\n"
-                   "  NOTE: last arg is the ENV VAR NAME whose value the broker holds; keys are never stored.\n");
+    if (argc < 2) {
+        print_providers();
+        print_presets();
+        if (!isatty(STDIN_FILENO)) {
+            printf("non-interactive: /connect <preset|list|catalog|add|key|use|rm>\n");
+            return;
+        }
+        char ans[128];
+        if (ask_line("select provider # or id (Enter cancels): ", ans, sizeof ans) || !*ans) return;
+        const mp_preset *p = NULL;
+        char *end = NULL; long k = strtol(ans, &end, 10);
+        if (end && *end == 0 && k > 0) p = mp_preset_by_index((int)k);
+        if (!p) p = mp_preset_find(ans);
+        if (!p) { printf("unknown preset '%s' (custom: /connect add ...)\n", ans); return; }
+        connect_preset(p);
         return;
     }
+    if (!strcmp(argv[1], "list")) { print_providers(); return; }
+    if (!strcmp(argv[1], "catalog")) { print_presets(); return; }
     if (!strcmp(argv[1], "add") && argc >= 6) {
         const char *ke = argc >= 7 ? argv[6] : "";
         int rc = mp_cfg_add(&g_cfg, argv[2], argv[3], argv[4], argv[5], ke);
@@ -137,6 +276,20 @@ static void cmd_connect(int argc, char **argv) {
         printf("added + activated '%s'. Cloud kinds need the broker running with %s exported;"
                " openai-local talks directly to your loopback server.\n",
                argv[2], ke && *ke ? ke : "the provider's key env");
+        return;
+    }
+    if (!strcmp(argv[1], "key") && argc >= 3) {
+        mp_provider *prov = mp_cfg_find(&g_cfg, argv[2]);
+        const char *env = prov ? prov->key_env : argv[2];
+        if (!mp_keys_valid_env_name(env)) {
+            printf("usage: /connect key <provider|ENV_VAR_NAME>\n"); return;
+        }
+        char key[1024] = "";
+        char prompt[300];
+        snprintf(prompt, sizeof prompt, "API key for %s (stored in %s): ", env, mp_keys_env_path());
+        if (ask_secret(prompt, key, sizeof key) || !*key) { printf("cancelled\n"); return; }
+        if (mp_keys_save(env, key) == 0) printf("stored %s (mode 0600); the broker picks it up on the next request\n", env);
+        else printf("could not store key; export %s in the broker environment instead\n", env);
         return;
     }
     if (!strcmp(argv[1], "rm") && argc >= 3) {
@@ -150,39 +303,84 @@ static void cmd_connect(int argc, char **argv) {
         printf("active provider: %s (%s) model=%s\n", p->name, mp_kind_name(p->kind), p->model);
         return;
     }
-    printf("bad /connect usage\n");
+    const mp_preset *p = mp_preset_find(argv[1]);
+    if (p) { connect_preset(p); return; }
+    printf("bad /connect usage (try /connect list | catalog | <preset> | add | key | rm | use)\n");
 }
 
-static void cmd_models(void) {
+/* List the active provider's live models. With a tty, also offer a numbered
+ * picker and save the choice. Optional argv[1] filters by substring. */
+static void cmd_models(int argc, char **argv) {
     mp_provider *prov = mp_cfg_active(&g_cfg);
-    if (!prov) { printf("no active provider\n"); return; }
-    char *resp = NULL; size_t rl = 0; int st = -1;
-    if (prov->kind == MP_KIND_OPENAI_LOCAL) {
-        st = mp_http_get_json_raw(prov->base_url, "/models", &resp, &rl);
-    } else {
-        char host[256];
-        if (host_of(prov->base_url, host, sizeof host) == 0) {
-            char path[320]; snprintf(path, sizeof path, "/%s/v1/models", host);
-            st = mp_broker_post(path, "", 0, &resp, &rl);
+    if (!prov) { printf("no active provider (use /connect)\n"); return; }
+    mp_model_list ml;
+    printf("[models] querying %s ...\n", prov->name);
+    if (mp_provider_list_models(prov, &ml) != 0) {
+        printf("model list unavailable — configured model: %s\n", prov->model);
+        printf("check the key (/connect key %s) and that the broker/local server is reachable\n",
+               prov->key_env[0] ? prov->key_env : prov->name);
+        return;
+    }
+    const char *filter = argc >= 2 ? argv[1] : NULL;
+    mp_model_list shown = {0};
+    for (int i = 0; i < ml.n; i++) {
+        if (filter && *filter && !strcasestr(ml.v[i], filter)) continue;
+        if (shown.n == shown.cap) {
+            int nc = shown.cap ? shown.cap * 2 : 32;
+            char **nv = realloc(shown.v, (size_t)nc * sizeof *nv);
+            if (!nv) break;
+            shown.v = nv; shown.cap = nc;
+        }
+        shown.v[shown.n++] = strdup(ml.v[i]);
+    }
+    mp_model_list_free(&ml);
+    if (shown.n == 0) {
+        printf("no models match '%s'\n", filter ? filter : "");
+        mp_model_list_free(&shown);
+        return;
+    }
+    cache_models(prov->name, &shown);
+    printf("models from %s (%d):\n", prov->name, shown.n);
+    int limit = shown.n > MODELS_SHOWN ? MODELS_SHOWN : shown.n;
+    const char *cur = g_cfg.session_model[0] ? g_cfg.session_model : prov->model;
+    for (int i = 0; i < limit; i++)
+        printf("%3d)%s %s\n", i + 1, !strcmp(cur, shown.v[i]) ? " *" : "  ", shown.v[i]);
+    if (shown.n > limit) printf("  ... %d more (use /models <filter>)\n", shown.n - limit);
+    if (isatty(STDIN_FILENO)) {
+        char chosen[192];
+        if (pick_model(&shown, cur, chosen, sizeof chosen, 1) > 0) {
+            mp_cfg_set_model(&g_cfg, chosen);
+            printf("model set to: %s\n", chosen);
         }
     }
-    if (st != 200 || !resp) {
-        printf("model list unavailable (status %d)%s — configured default: %s\n", st,
-               st == -1 ? " (is the broker/local server up? GET /models may also be unsupported)" : "",
-               prov->model);
-        free(resp); return;
-    }
-    cJSON *j = cJSON_Parse(resp); free(resp);
-    const cJSON *data = j ? cJSON_GetObjectItemCaseSensitive(j, "data") : NULL;
-    if (cJSON_IsArray(data)) {
-        printf("models from %s:\n", prov->name);
-        const cJSON *m = NULL;
-        cJSON_ArrayForEach(m, data) {
-            const cJSON *id = cJSON_GetObjectItemCaseSensitive(m, "id");
-            if (cJSON_IsString(id)) printf("  %s\n", id->valuestring);
+    mp_model_list_free(&shown);
+}
+
+static void cmd_model(int argc, char **argv) {
+    mp_provider *prov = mp_cfg_active(&g_cfg);
+    if (argc >= 2) {
+        const char *id = argv[1];
+        char *end = NULL; long k = strtol(argv[1], &end, 10);
+        if (end && *end == 0 && k > 0 && g_models.n > 0 && prov &&
+            !strcmp(g_models_provider, prov->name) && k <= g_models.n) {
+            id = g_models.v[k - 1];
         }
-    } else { printf("(no 'data' array in response)\n"); }
-    if (j) cJSON_Delete(j);
+        if (mp_cfg_set_model(&g_cfg, id) == 0) printf("model set to: %s\n", id);
+        else printf("could not save model choice\n");
+        return;
+    }
+    if (!prov) { printf("no active provider (use /connect)\n"); return; }
+    if (g_models.n > 0 && !strcmp(g_models_provider, prov->name) && isatty(STDIN_FILENO)) {
+        char chosen[192];
+        const char *cur = g_cfg.session_model[0] ? g_cfg.session_model : prov->model;
+        printf("models from %s (%d):\n", prov->name, g_models.n);
+        if (pick_model(&g_models, cur, chosen, sizeof chosen, 1) > 0) {
+            mp_cfg_set_model(&g_cfg, chosen);
+            printf("model set to: %s\n", chosen);
+        }
+        return;
+    }
+    cmd_models(0, NULL);
 }
 
 static void cmd_policy(int argc, char **argv) {
@@ -204,25 +402,17 @@ static int handle_slash(char *line, mp_agent *agent) {
     for (char *t = strtok(line, " \t\n"); t && argc < 8; t = strtok(NULL, " \t\n")) argv[argc++] = t;
     if (!argc) return 0;
     if (!strcmp(argv[0], "/connect")) { cmd_connect(argc, argv); return 0; }
-    if (!strcmp(argv[0], "/models"))  { cmd_models(); return 0; }
-    if (!strcmp(argv[0], "/provider")){ cmd_connect(2, (char*[]){"/connect","list"}); return 0; }
+    if (!strcmp(argv[0], "/models"))  { cmd_models(argc, argv); return 0; }
+    if (!strcmp(argv[0], "/provider")){ cmd_connect(argc, argv); return 0; }
     if (!strcmp(argv[0], "/policy"))  { cmd_policy(argc, argv); return 0; }
-    if (!strcmp(argv[0], "/model")) {
-        if (argc >= 2) {
-            snprintf(g_cfg.session_model, sizeof g_cfg.session_model, "%s", argv[1]);
-            mp_cfg_save(&g_cfg);
-            printf("model set to: %s\n", argv[1]);
-        } else {
-            mp_provider *p = mp_cfg_active(&g_cfg);
-            printf("current: %s (try /models for a live list)\n",
-                   g_cfg.session_model[0] ? g_cfg.session_model : (p ? p->model : "?"));
-        }
-        return 0;
-    }
+    if (!strcmp(argv[0], "/model"))   { cmd_model(argc, argv); return 0; }
     if (!strcmp(argv[0], "/help")) {
         printf("commands:\n"
-               "  /connect list|add <name> <kind> <base_url> <model> [KEY_ENV]|rm <n>|use <n>\n"
-               "  /model [name]      show/set model        /models  live model list\n"
+               "  /connect            pick a cloud/local provider (enter key + model)\n"
+               "  /connect <preset>   connect directly (openai, anthropic, google, groq,\n"
+               "                      openrouter, together, mistral, deepseek, xai, ...)\n"
+               "  /connect list|catalog|add|key|rm|use\n"
+               "  /model [n|name]     pick/set model   /models [filter]  live model list\n"
                "  /policy [ask|auto-read|full-auto]       permission mode\n"
                "  /thinking          toggle reasoning stream\n"
                "  /approve           list session 'always allow' grants info\n"

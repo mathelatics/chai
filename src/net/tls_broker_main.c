@@ -27,6 +27,7 @@
 #include <signal.h>
 #include <ctype.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <netdb.h>
 #include <arpa/inet.h>
@@ -58,6 +59,45 @@ static int safe_header_value(const char *s) {
     return 1;
 }
 
+/* Keys entered in the TUI are written by the client to ~/.minipi/.env (0600).
+ * The broker resolves them here when the variable is not already in its env.
+ * Only the NAME crosses the loopback socket; the value is read on this side. */
+static const char *env_file_path(void) {
+    static char p[4096];
+    const char *explicit_path = getenv("MINIPI_ENV_FILE");
+    if (explicit_path && *explicit_path) return explicit_path;
+    const char *home = getenv("MINIPI_HOME");
+    if (!home || *home != '/') home = getenv("HOME");
+    if (!home || *home != '/') return NULL;
+    snprintf(p, sizeof p, "%s/.minipi/.env", home);
+    return p;
+}
+static int env_file_lookup(const char *name, char *out, size_t n) {
+    const char *path = env_file_path();
+    if (!path) return 0;
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    size_t nl = strlen(name);
+    char line[2048]; int found = 0;
+    while (fgets(line, sizeof line, f)) {
+        char *s = line;
+        while (*s == ' ' || *s == '\t') s++;
+        if (strncmp(s, name, nl) || s[nl] != '=') continue;
+        s += nl + 1;
+        size_t k = 0; int quote = 0;
+        if (*s == '"' || *s == '\'') quote = *s++;
+        while (*s && (quote ? *s != quote : *s != '\r' && *s != '\n') && k + 1 < n) {
+            if (quote == '"' && *s == '\\' && s[1]) s++;
+            out[k++] = *s++;
+        }
+        out[k] = 0;
+        if (k) found = 1;
+        break;
+    }
+    fclose(f);
+    return found;
+}
+
 /* ------------------------------------------------------------- allow-list */
 typedef struct { char host[128]; } allow_t;
 static allow_t g_allow[64];
@@ -73,7 +113,10 @@ static void load_allowlist(void) {
     /* defaults mirror tools/tls_broker.py */
     static const char *d[] = {
         "integrate.api.nvidia.com", "api.openai.com", "api.anthropic.com",
-        "generativelanguage.googleapis.com", "api.groq.com" };
+        "generativelanguage.googleapis.com", "api.groq.com",
+        "openrouter.ai", "api.together.xyz", "api.mistral.ai",
+        "api.deepseek.com", "api.x.ai", "api.fireworks.ai",
+        "api.cerebras.ai" };
     for (size_t i = 0; i < sizeof d / sizeof d[0] && g_nallow < 64; i++)
         snprintf(g_allow[g_nallow++].host, 128, "%s", d[i]);
     const char *extra = getenv("MINIPI_ALLOWED_HOSTS"); /* comma-separated */
@@ -136,6 +179,12 @@ static SSL_CTX *make_client_ctx(void) {
 }
 
 /* connect to host:port via getaddrinfo (IPv4/IPv6), plain TCP */
+static void set_io_timeout(int fd, int sec) {
+    struct timeval tv = { sec, 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+}
+
 static int tcp_connect(const char *host, int port) {
     char pstr[8]; snprintf(pstr, sizeof pstr, "%d", port);
     struct addrinfo hints, *res = NULL;
@@ -165,7 +214,10 @@ static int relay_body(conn *up, int client_fd, int chunked_relay, long content_l
         if (up->ssl) n = SSL_read(up->ssl, rbuf, sizeof rbuf);
         else        n = read(up->fd, rbuf, sizeof rbuf);
         if (n < 0) { if (errno == EINTR) continue; return got_any; }
-        if (n == 0) return 1;
+        if (n == 0) {
+            if (chunked_relay) wr_all(client_fd, "0\r\n\r\n", 5);
+            return 1;
+        }
         got_any = 1;
         if (chunked_relay) {
             char frame[32];
@@ -183,6 +235,7 @@ static int relay_body(conn *up, int client_fd, int chunked_relay, long content_l
 /* ------------------------------------------------------- per-client serve */
 #define HDR_CAP 16384
 static void serve_client(int cfd) {
+    set_io_timeout(cfd, 120);   /* never leave a forked child stuck forever */
     conn cli = { .fd = cfd, .ssl = NULL, .len = 0, .pos = 0 };
     char hdr[HDR_CAP];
     if (!rd_headers(&cli, hdr, sizeof hdr)) return;
@@ -198,6 +251,7 @@ static void serve_client(int cfd) {
 
     /* collect headers of interest */
     char key_env[128] = "";
+    char auth_style[32] = "bearer";
     long clen = 0;
     int streaming_hint = 0;
     {
@@ -210,6 +264,9 @@ static void serve_client(int cfd) {
             if (!strncasecmp(hv, "X-Minipi-Key-Env:", 17)) {
                 const char *v = hv + 17; while (*v == ' ') v++;
                 snprintf(key_env, sizeof key_env, "%.127s", v);
+            } else if (!strncasecmp(hv, "X-Minipi-Auth:", 14)) {
+                const char *v = hv + 14; while (*v == ' ') v++;
+                snprintf(auth_style, sizeof auth_style, "%.31s", v);
             } else if (!strncasecmp(hv, "Content-Length:", 15)) {
                 clen = atol(hv + 15);
             }
@@ -219,6 +276,14 @@ static void serve_client(int cfd) {
 
     /* read body (if any) exactly clen bytes from what remains in cli buffer+socket */
     char *body = NULL; size_t blen = 0;
+    if (clen > 64L * 1024 * 1024) {         /* loopback DoS guard */
+        const char *msg = "{\"error\":\"request too large\"}";
+        char resp[256];
+        int rl = snprintf(resp, sizeof resp,
+            "HTTP/1.1 413 Payload Too Large\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
+            strlen(msg));
+        wr_all(cfd, resp, (size_t)rl); wr_all(cfd, msg, strlen(msg)); return;
+    }
     if (clen > 0) {
         body = malloc((size_t)clen + 1);
         size_t have = cli.len - cli.pos;              /* leftover already buffered */
@@ -266,14 +331,22 @@ static void serve_client(int cfd) {
     }
 
     /* resolve API key from broker env by NAME (never accept raw values) */
-    const char *auth_hdr = NULL;
-    char authval[1024];
+    char auth_line[1400] = "";
     if (key_env[0]) {
         if (!valid_env_name(key_env)) { free(body); return; }
         const char *kv = getenv(key_env);
+        char filev[1024];
+        if (!kv || !*kv) { if (env_file_lookup(key_env, filev, sizeof filev)) kv = filev; }
         if (kv && *kv && safe_header_value(kv)) {
-            snprintf(authval, sizeof authval, "Bearer %s", kv);
-            auth_hdr = authval;
+            if (!strcmp(auth_style, "anthropic"))
+                snprintf(auth_line, sizeof auth_line,
+                         "x-api-key: %s\r\nanthropic-version: 2023-06-01\r\n", kv);
+            else if (!strcmp(auth_style, "x-api-key") || !strcmp(auth_style, "x-api-key-nvidia"))
+                snprintf(auth_line, sizeof auth_line, "x-api-key: %s\r\n", kv);
+            else if (!strcmp(auth_style, "none"))
+                auth_line[0] = 0;
+            else
+                snprintf(auth_line, sizeof auth_line, "Authorization: Bearer %s\r\n", kv);
         }
     }
 
@@ -296,15 +369,15 @@ static void serve_client(int cfd) {
         wr_all(cfd, msg, (size_t)l);
         SSL_free(ssl); SSL_CTX_free(ctx); close(ufd); free(body); return;
     }
+    set_io_timeout(ufd, 120);
     conn up = { .fd = ufd, .ssl = ssl, .len = 0, .pos = 0 };
 
     /* build upstream request (strip client Authorization; inject ours) */
     char ureq[8192];
     int ul = snprintf(ureq, sizeof ureq,
         "%s %s HTTP/1.1\r\nHost: %s\r\nAccept: */*\r\nUser-Agent: minipi-broker/1.0\r\n"
-        "%s%s%sContent-Type: application/json\r\nContent-Length: %ld\r\nConnection: close\r\n\r\n",
-        method, uppath, uphost,
-        auth_hdr ? "Authorization: " : "", auth_hdr ? auth_hdr : "", auth_hdr ? "\r\n" : "",
+        "%sContent-Type: application/json\r\nContent-Length: %ld\r\nConnection: close\r\n\r\n",
+        method, uppath, uphost, auth_line,
         body ? (long)blen : 0L);
     if (ul < 0 || (size_t)ul >= sizeof ureq) { goto cleanup; }
     if (!wr_conn(&up, ureq, (size_t)ul)) goto cleanup;

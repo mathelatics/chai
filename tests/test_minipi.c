@@ -15,7 +15,9 @@
 #include "session/store.h"
 #include "security/policy.h"
 #include "config/config.h"
+#include "config/keys.h"
 #include "util/paths.h"
+#include <sys/stat.h>
 #include "cJSON.h"
 #include <assert.h>
 #include <stdio.h>
@@ -201,6 +203,52 @@ static void t_config(void){
     printf("config ok\n");
 }
 
+/* ---- multi-provider connect metadata: presets, auth, key storage --------- */
+static void t_connect_meta(void){
+    int n=0; mp_presets(&n);
+    assert(n>=15);
+    const mp_preset *o=mp_preset_find("openai");
+    assert(o && !o->local && o->auth==MP_AUTH_BEARER && !strcmp(o->kind,"openai"));
+    const mp_preset *a=mp_preset_find("anthropic");
+    assert(a && !a->local && a->auth==MP_AUTH_ANTHROPIC && !strcmp(a->kind,"anthropic"));
+    const mp_preset *l=mp_preset_find("ollama");
+    assert(l && l->local && mp_url_is_loopback_http(l->base_url) && l->key_env[0]==0);
+    assert(mp_preset_count_local()>=4 && !mp_preset_find("no-such-provider"));
+    assert(!strcmp(mp_auth_name(MP_AUTH_ANTHROPIC),"anthropic"));
+
+    char dir[256]; snprintf(dir,sizeof dir,"/tmp/minipi-conn-%d",(int)getpid());
+    setenv("MINIPI_HOME",dir,1); mp_mkdir_p(dir);
+    mp_config c; mp_cfg_load(&c,NULL);
+    assert(mp_cfg_add_ex(&c,"claude","anthropic","https://api.anthropic.com/v1",
+                         "claude-sonnet-4-5","ANTHROPIC_API_KEY",MP_AUTH_ANTHROPIC)==0);
+    assert(mp_cfg_use(&c,"claude")==0);
+    assert(mp_cfg_set_model(&c,"claude-opus-4-1")==0);
+    mp_config c2; assert(mp_cfg_load(&c2,NULL)==0);
+    mp_provider *q=mp_cfg_find(&c2,"claude");
+    assert(q && q->auth==MP_AUTH_ANTHROPIC && !strcmp(q->model,"claude-sonnet-4-5"));
+    assert(!strcmp(c2.session_model,"claude-opus-4-1"));
+    /* plain mp_cfg_add still derives auth from kind */
+    mp_config c3; mp_cfg_load(&c3,NULL);
+    assert(mp_cfg_add(&c3,"ant2","anthropic","https://api.anthropic.com/v1","m","K")==0);
+    assert(mp_cfg_find(&c3,"ant2")->auth==MP_AUTH_ANTHROPIC);
+
+    /* interactive key storage: 0600 file, no key value in config.toml */
+    unsetenv("DEEPSEEK_API_KEY");
+    assert(mp_keys_save("DEEPSEEK_API_KEY","sk-test-123")==0);
+    char kv[64];
+    assert(mp_keys_lookup("DEEPSEEK_API_KEY",kv,sizeof kv) && !strcmp(kv,"sk-test-123"));
+    struct stat st;
+    assert(stat(mp_keys_env_path(),&st)==0 && (st.st_mode & 077) == 0);
+    assert(mp_keys_save("DEEPSEEK_API_KEY","sk-test-456")==0);
+    assert(mp_keys_lookup("DEEPSEEK_API_KEY",kv,sizeof kv) && !strcmp(kv,"sk-test-456"));
+    FILE *f=fopen(mp_cfg_default_path(),"r"); assert(f);
+    char buf[65536]; size_t rn=fread(buf,1,sizeof buf-1,f); fclose(f); buf[rn]=0;
+    assert(!strstr(buf,"sk-test-"));
+    char cmd[600]; snprintf(cmd,sizeof cmd,"rm -rf '%s'",dir); if(system(cmd)){}
+    unsetenv("MINIPI_HOME");
+    printf("connect metadata ok\n");
+}
+
 /* ---- P0: home fallback order is loud, never silent ----------------------- */
 static void t_paths(void){
     setenv("MINIPI_HOME","/tmp/mp-home-a",1);
@@ -364,6 +412,6 @@ int main(void){ t_sha256();t_b64();t_uuid();t_utf8();t_diff();t_schema();
     fprintf(stderr,"[step] events_jsonl\n"); fflush(stderr); t_events_jsonl();
     fprintf(stderr,"[step] paths\n"); fflush(stderr); t_paths();
     fprintf(stderr,"[step] store\n"); fflush(stderr); t_store();
-    fprintf(stderr,"[step] policy\n"); fflush(stderr); t_policy();
-    fprintf(stderr,"[step] config\n"); fflush(stderr); t_config();
+    fprintf(stderr,"[step] policy\n"); fflush(stderr); t_policy();    fprintf(stderr, "[step] config\n"); fflush(stderr); t_config();
+    fprintf(stderr, "[step] connect_meta\n"); fflush(stderr); t_connect_meta();
     puts("ALL TESTS PASS"); return 0; }

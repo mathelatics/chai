@@ -10,8 +10,6 @@ typedef struct { char *text; cJSON *tool_calls /* array of {id,name,arguments} o
                  char stop_reason[32]; /* "stop"|"length"|"tool_calls"|"abort"|"" */ } mp_reply;
 mp_reply *mp_provider_complete(const char *model, const mp_ctx *ctx);
 void      mp_reply_free(mp_reply *r);
-/* provider registry (khash in later milestones) */
-int mp_provider_set_base_url(const char *url);   /* dev mode: http:// localhost mock */
 /* NVIDIA Nemotron streaming variant: parses SSE chunks incl. delta.reasoning_content.
  * Returns reply->text = content, reply->tool_calls may hold parsed tool calls. */
 typedef void (*mp_stream_fn)(const char *reasoning_delta, const char *content_delta, void *ud);
@@ -28,4 +26,12 @@ mp_reply *mp_nemotron_stream_ex(const char *model, const mp_ctx *ctx,
                                 double top_p, mp_stream_fn on_delta, void *ud,
                                 const cJSON *tools, const char *local_base,
                                 const char *broker_host);
+
+/* Native Anthropic Messages API (cloud via broker; broker adds x-api-key and
+ * anthropic-version). upstream_path is the base_url path, e.g. "/v1". */
+mp_reply *mp_anthropic_stream_ex(const char *model, const mp_ctx *ctx,
+                                 int enable_thinking, long max_tokens, double temperature,
+                                 double top_p, mp_stream_fn on_delta, void *ud,
+                                 const cJSON *tools, const char *key_env,
+                                 const char *broker_host, const char *upstream_path);
 #endif

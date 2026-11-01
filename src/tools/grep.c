@@ -117,19 +117,6 @@ static void walk(gctx *g, const char *dir, const char *rel, int max_depth) {
     closedir(d);
 }
 
-/* escape a literal pattern into an ERE-safe form (for invalid-UTF robustness
- * we only ever build from validated args upstream in the registry) */
-static int compile_ere(regex_t *re, const char *pat, int icase) {
-    char esc[1024]; size_t e = 0;
-    for (size_t k = 0; pat[k] && e + 2 < sizeof esc; k++) {
-        char c = pat[k];
-        if (strchr("\\^$.|?*+()[]{}", c)) esc[e++] = '\\';
-        esc[e++] = c;
-    }
-    esc[e] = '\0';
-    return regcomp(re, esc, REG_EXTENDED | (icase ? REG_ICASE : 0));
-}
-
 char *mp_tool_grep(const cJSON *args, void *ud) {
     const char *root = ud;
     const cJSON *pj = cJSON_GetObjectItemCaseSensitive(args, "pattern");
@@ -148,18 +135,19 @@ char *mp_tool_grep(const cJSON *args, void *ud) {
     if (looks_regex && !icase) {
         if (regcomp(&m.re, pat, REG_EXTENDED)) { free(canon); return strdup("error: invalid regular expression"); }
         m.used_regex = 1;
-    } else if (looks_regex || icase) {
-        /* regex-with-icase, or literal-with-icase over long pattern: escape and
-         * compile once (REG_ICASE handles folding correctly for ASCII) */
-        if (strlen(pat) < sizeof m.lit && !looks_regex) {
-            size_t i = 0;
-            for (; pat[i]; i++) m.lit[i] = (char)tolower((unsigned char)pat[i]);
-            m.lit[i] = '\0';
-            m.icase_lit = 1;
-        } else {
-            if (compile_ere(&m.re, pat, icase)) { free(canon); return strdup("error: invalid pattern"); }
-            m.used_regex = 1;
+    } else if (looks_regex) {
+        /* regex + ignore_case: compile the regex as written (do NOT escape it) */
+        if (regcomp(&m.re, pat, REG_EXTENDED | REG_ICASE)) {
+            free(canon); return strdup("error: invalid regular expression");
         }
+        m.used_regex = 1;
+    } else if (icase) {
+        /* literal + ignore_case: fast case-folded substring match */
+        size_t i = 0;
+        for (; pat[i] && i + 1 < sizeof m.lit; i++)
+            m.lit[i] = (char)tolower((unsigned char)pat[i]);
+        m.lit[i] = '\0';
+        m.icase_lit = 1;
     } else {
         snprintf(m.lit, sizeof m.lit, "%.255s", pat);
     }

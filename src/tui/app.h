@@ -11,9 +11,8 @@
 int mp_repl_run(mp_agent *agent, const char *model, int thinking, long max_tokens,
                 const char *sessdir);
 
-/* Defined in app.c: full-screen entry for --tui. Delegates to mp_repl_run
- * (ANSI live-region stack); termbox2 overlay activates via render.c if the
- * build defines MINIPI_WITH_TERMBOX2. */
+/* Defined in app.c: full-screen termbox2 entry for --tui. Falls back to the
+ * line REPL when the terminal cannot be initialized or stdio is piped. */
 int mp_tui_main(mp_agent *agent, const char *model, int thinking, long max_tokens,
                 const char *sessdir);
 #endif

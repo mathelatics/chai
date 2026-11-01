@@ -1,6 +1,6 @@
 /* tests/smoke_deps.c — prove every vendored MIT dependency compiles, links,
  * and runs. Covers: cJSON, log.c, http_parser, tomlc17, klib (khash/kvec),
- * termbox2 (link check only; no TTY required), libuv (loop + timer). */
+ * termbox2 (link check only; no TTY required). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,12 +13,8 @@
 #include "termbox2.h"   /* declarations only; impl lives in the shim TU */
 #include "khash.h"
 #include "kvec.h"
-#include "uv.h"
 
 KHASH_MAP_INIT_STR(reg, int)
-
-static int g_timer_fired = 0;
-static void on_timer(uv_timer_t *t) { (void)t; g_timer_fired = 1; }
 
 int main(void) {
     /* --- cJSON: parse a tool call, re-serialize it ---------------------- */
@@ -62,18 +58,10 @@ int main(void) {
     log_set_quiet(1);
     log_info("vendored deps smoke test running");
 
-    /* --- libuv: event loop with a timer ---------------------------------- */
-    uv_loop_t *loop = uv_default_loop();
-    uv_timer_t tmr;
-    uv_timer_init(loop, &tmr);
-    uv_timer_start(&tmr, on_timer, 1, 0);
-    uv_run(loop, UV_RUN_DEFAULT);
-    assert(g_timer_fired);
-
     /* --- termbox2: link-only check (no terminal needed in CI) ------------ */
     int rc = tb_set_output_mode(TB_OUTPUT_NORMAL);
     assert(rc == TB_ERR_NOT_INIT); /* no TTY in sandbox is fine */
 
-    printf("ALL VENDORED DEPS COMPILE AND LINK (incl. libuv, termbox2, klib)\n");
+    printf("ALL VENDORED DEPS COMPILE AND LINK (termbox2, klib, cjson, tomlc17)\n");
     return 0;
 }

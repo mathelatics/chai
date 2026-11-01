@@ -1,9 +1,11 @@
-/* JSONL session store with sha256 hash-chain checkpoints.
- * Every line: {"id","parent","role","content","tool_calls"?,"hash"} where
- * hash = sha256(prev_hash || id || role || content) — tamper-evident chain.
+/* JSONL session store with sha256 hash-chain checkpoints + timestamps.
+ * Every line: {"id","parent","timestamp","role","content","tool_calls"?,
+ * "meta"?,"hash"} where hash = sha256(prev_hash || id || role || content || ts)
  * All failures log errno + full path (silent store failures hid a session-dir
  * bug; never again). Store failure is non-fatal by design: the session keeps
- * running in memory, but the user always sees WHY nothing was persisted. */
+ * running in memory, but the user always sees WHY nothing was persisted.
+ * Timestamps are ISO-8601 format for easy debugging and replay analysis.
+ */
 #include "session/store.h"
 #include "util/sha256.h"
 #include "util/paths.h"
@@ -18,7 +20,7 @@
 struct mp_store { char path[4096]; char prev_hash[65]; FILE *f; int n; };
 
 static void chain_hash(const char *prev, const char *id, const char *role,
-                       const char *content, char out[65]) {
+                       const char *content, const char *ts, char out[65]) {
     mp_sha256 h; mp_sha256_init(&h);
     mp_sha256_update(&h, prev, strlen(prev));
     mp_sha256_update(&h, "|", 1);
@@ -27,6 +29,8 @@ static void chain_hash(const char *prev, const char *id, const char *role,
     mp_sha256_update(&h, role, strlen(role));
     mp_sha256_update(&h, "|", 1);
     mp_sha256_update(&h, content, strlen(content));
+    mp_sha256_update(&h, "|", 1);
+    mp_sha256_update(&h, ts, strlen(ts));
     unsigned char d[32]; mp_sha256_final(&h, d);
     static const char hx[] = "0123456789abcdef";
     for (int i = 0; i < 32; i++) { out[i*2] = hx[d[i] >> 4]; out[i*2+1] = hx[d[i] & 15]; }
@@ -58,7 +62,11 @@ mp_store *mp_store_open(const char *sessdir, const char *session_id) {
                 memcpy(s->prev_hash, h->valuestring, 65);
                 s->n++;
             } else if (cJSON_IsString(id) && cJSON_IsString(ro) && cJSON_IsString(ct)) {
-                char calc[65]; chain_hash(s->prev_hash, id->valuestring, ro->valuestring, ct->valuestring, calc);
+                /* Support both old format (no timestamp field) and new format (with timestamp) */
+                char ts_buf[32] = "";
+                const cJSON *ts_j = cJSON_GetObjectItemCaseSensitive(j, "timestamp");
+                const char *ts = ts_j && cJSON_IsString(ts_j) ? ts_j->valuestring : ts_buf;
+                char calc[65]; chain_hash(s->prev_hash, id->valuestring, ro->valuestring, ct->valuestring, ts, calc);
                 memcpy(s->prev_hash, calc, 65); s->n++;
             }
             cJSON_Delete(j);
@@ -79,10 +87,12 @@ int mp_store_append(mp_store *s, const char *role, const char *content,
     if (!s || !s->f) return -1;
     char id[37];
     if (mp_uuid_v4(id)) { log_error("store: no entropy for uuid: %s", strerror(errno)); return -1; }
+    char ts[32]; snprintf(ts, sizeof ts, "%ld", (long)time(NULL));
     char hash[65];
-    chain_hash(s->prev_hash, id, role ? role : "", content ? content : "", hash);
+    chain_hash(s->prev_hash, id, role ? role : "", content ? content : "", ts, hash);
     cJSON *o = cJSON_CreateObject();
     cJSON_AddStringToObject(o, "id", id);
+    cJSON_AddStringToObject(o, "timestamp", ts);
     /* parent = previous entry id not tracked per-line here; chain hash covers it */
     cJSON_AddStringToObject(o, "parent", s->n ? "" : "root");
     cJSON_AddStringToObject(o, "role", role ? role : "");
@@ -150,8 +160,12 @@ static int store_scan(const char *path, mp_ctx *out_ctx /*may be NULL*/,
             log_error("store: %s:%d: missing/invalid chain fields", path, ln);
             if (!bad) bad = ln;
         } else {
+            /* Support both old format (no timestamp field) and new format (with timestamp) */
+            char ts_buf[32] = "";
+            const cJSON *ts_j = cJSON_GetObjectItemCaseSensitive(j, "timestamp");
+            const char *ts = ts_j && cJSON_IsString(ts_j) ? ts_j->valuestring : ts_buf;
             char calc[65];
-            chain_hash(prev, id->valuestring, ro->valuestring, ct->valuestring, calc);
+            chain_hash(prev, id->valuestring, ro->valuestring, ct->valuestring, ts, calc);
             if (memcmp(calc, h->valuestring, 65) != 0) {
                 log_error("store: %s:%d: CHAIN MISMATCH (tamper or truncation): want %s got %s",
                           path, ln, calc, h->valuestring);

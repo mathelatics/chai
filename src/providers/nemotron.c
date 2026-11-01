@@ -302,7 +302,7 @@ mp_reply *mp_nemotron_stream_ex(const char *model, const mp_ctx *ctx,
                      snprintf(hpfx, sizeof hpfx, "%s", slash); }
         else { snprintf(base_only, sizeof base_only, "%s", local_base); hpfx[0] = 0; }
         char cpath[640]; snprintf(cpath, sizeof cpath, "%s/chat/completions", hpfx);
-        status = mp_http_post_json_raw(base_only, cpath, txt, &resp, &rlen);
+        status = mp_http_post_json_raw(base_only, txt, &resp, &rlen);
     } else {
         static const char kDefaultHost[] = "integrate.api.nvidia.com";
         const char *host = (broker_host && *broker_host) ? broker_host : kDefaultHost;

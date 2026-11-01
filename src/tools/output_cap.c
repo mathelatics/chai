@@ -90,16 +90,21 @@ char *mp_output_cap(const char *text, size_t len,
     char *obuf = malloc(obuf_cap);
     if (!scratch || !obuf) { free(scratch); free(obuf); free(v); return NULL; }
     size_t used = 0, emitted = 0;
-    int marker_written = 0;
+    int marker_written = 0, width_elided = 0;
 
     /* helper macro-ish: emit the elision marker once */
     #define EMIT_MARKER(NL_EXTRA) do {                                        \
         if (!marker_written) {                                                \
             marker_written = 1;                                               \
             char mk[160];                                                     \
-            int mm = snprintf(mk, sizeof mk,                                  \
-                "[... %d lines elided by minipi output cap ...]\n",           \
-                elided_lines + (NL_EXTRA));                                   \
+            int mm;                                                           \
+            if (elided_lines + (NL_EXTRA) > 0)                                \
+                mm = snprintf(mk, sizeof mk,                                  \
+                    "[... %d lines elided by minipi output cap ...]\n",       \
+                    elided_lines + (NL_EXTRA));                               \
+            else                                                              \
+                mm = snprintf(mk, sizeof mk,                                  \
+                    "[... content elided by minipi output cap ...]\n");       \
             if (mm > 0 && used + (size_t)mm < obuf_cap) {                     \
                 memcpy(obuf + used, mk, (size_t)mm); used += (size_t)mm;      \
             }                                                                 \
@@ -116,6 +121,7 @@ char *mp_output_cap(const char *text, size_t len,
             EMIT_MARKER(0);
             break;
         }
+        if (max_width > 0 && v[i].n > (size_t)max_width) width_elided = 1;
         size_t w = trim_line(v[i].p, v[i].n, max_width, scratch, scratchcap);
         /* sanitize into a separate buffer: the streaming sanitizer may hold
          * back trailing bytes of an incomplete codepoint, so in==out would
@@ -140,7 +146,7 @@ char *mp_output_cap(const char *text, size_t len,
         memcpy(obuf + used, scratch, w); used += w; obuf[used++] = '\n';
         emitted += w + 1;
     }
-    if (!marker_written && elided_lines > 0) EMIT_MARKER(0);
+    if (!marker_written && (elided_lines > 0 || width_elided)) EMIT_MARKER(0);
     #undef EMIT_MARKER
     free(scratch); free(v);
     obuf[used] = 0;

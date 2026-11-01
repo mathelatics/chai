@@ -5,3 +5,4 @@ build/
 
 # Reference clones for study only — never vendored into the agent.
 rough/
+docs/pi/

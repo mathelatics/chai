@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>   /* strcasecmp for preset lookup */
 
 const char *mp_kind_name(mp_pkind k) {
     switch (k) { case MP_KIND_OPENAI: return "openai";
@@ -22,6 +23,70 @@ int mp_kind_parse(const char *s, mp_pkind *out) {
     if (!strcmp(s, "anthropic")) { *out = MP_KIND_ANTHROPIC; return 0; }
     if (!strcmp(s, "openai-local") || !strcmp(s, "local")) { *out = MP_KIND_OPENAI_LOCAL; return 0; }
     return -1;
+}
+
+const char *mp_auth_name(mp_auth a) {
+    switch (a) { case MP_AUTH_BEARER: return "bearer";
+                 case MP_AUTH_ANTHROPIC: return "anthropic";
+                 case MP_AUTH_X_API_KEY: return "x-api-key";
+                 case MP_AUTH_NONE: return "none";
+                 default: return "bearer"; }
+}
+int mp_auth_parse(const char *s, mp_auth *out) {
+    if (!s || !out) return -1;
+    if (!strcmp(s, "bearer"))    { *out = MP_AUTH_BEARER; return 0; }
+    if (!strcmp(s, "anthropic") || !strcmp(s, "x-api-key")) { *out = MP_AUTH_ANTHROPIC; return 0; }
+    if (!strcmp(s, "none"))      { *out = MP_AUTH_NONE; return 0; }
+    return -1;
+}
+
+/* Built-in provider catalog. Everything user-facing goes through this table so
+ * /connect, /models and the docs cannot drift apart. Only OpenAI-compatible
+ * and native Anthropic wire formats are needed for the current ecosystem. */
+static const mp_preset g_presets[] = {
+    /* ---- cloud ---- */
+    { "openai",     "OpenAI",              "openai",      "https://api.openai.com/v1",                              "gpt-4o-mini",                                  "OPENAI_API_KEY",       MP_AUTH_BEARER,     0 },
+    { "anthropic",  "Anthropic Claude",    "anthropic",   "https://api.anthropic.com/v1",                           "claude-sonnet-4-5",                            "ANTHROPIC_API_KEY",    MP_AUTH_ANTHROPIC,  0 },
+    { "google",     "Google Gemini",       "openai",      "https://generativelanguage.googleapis.com/v1beta/openai", "gemini-2.0-flash",                            "GEMINI_API_KEY",       MP_AUTH_BEARER,     0 },
+    { "groq",       "Groq",                "openai",      "https://api.groq.com/openai/v1",                         "llama-3.3-70b-versatile",                      "GROQ_API_KEY",         MP_AUTH_BEARER,     0 },
+    { "openrouter", "OpenRouter",          "openai",      "https://openrouter.ai/api/v1",                           "openai/gpt-4o-mini",                           "OPENROUTER_API_KEY",   MP_AUTH_BEARER,     0 },
+    { "together",   "Together AI",         "openai",      "https://api.together.xyz/v1",                            "meta-llama/Llama-3.3-70B-Instruct-Turbo",      "TOGETHER_API_KEY",     MP_AUTH_BEARER,     0 },
+    { "mistral",    "Mistral AI",          "openai",      "https://api.mistral.ai/v1",                              "mistral-large-latest",                         "MISTRAL_API_KEY",      MP_AUTH_BEARER,     0 },
+    { "deepseek",   "DeepSeek",            "openai",      "https://api.deepseek.com/v1",                            "deepseek-chat",                                "DEEPSEEK_API_KEY",     MP_AUTH_BEARER,     0 },
+    { "xai",        "xAI Grok",            "openai",      "https://api.x.ai/v1",                                    "grok-2-latest",                                "XAI_API_KEY",          MP_AUTH_BEARER,     0 },
+    { "fireworks",  "Fireworks AI",        "openai",      "https://api.fireworks.ai/inference/v1",                  "accounts/fireworks/models/llama-v3p3-70b-instruct", "FIREWORKS_API_KEY", MP_AUTH_BEARER,    0 },
+    { "cerebras",   "Cerebras",            "openai",      "https://api.cerebras.ai/v1",                             "llama-3.3-70b",                                "CEREBRAS_API_KEY",     MP_AUTH_BEARER,     0 },
+    { "nvidia",     "NVIDIA NIM",          "nemotron",    "https://integrate.api.nvidia.com/v1",                    "nvidia/nemotron-3.5-lightning-30b-a3b",        "NVIDIA_API_KEY",       MP_AUTH_BEARER,     0 },
+    /* ---- local inference (loopback only, no key) ---- */
+    { "ollama",     "Ollama",              "openai-local", "http://127.0.0.1:11434/v1",                             "llama3.2",                                     "",                     MP_AUTH_NONE,       1 },
+    { "lmstudio",   "LM Studio",           "openai-local", "http://127.0.0.1:1234/v1",                              "local-model",                                  "",                     MP_AUTH_NONE,       1 },
+    { "llamacpp",   "llama.cpp server",    "openai-local", "http://127.0.0.1:8080/v1",                              "model",                                        "",                     MP_AUTH_NONE,       1 },
+    { "vllm",       "vLLM",                "openai-local", "http://127.0.0.1:8000/v1",                              "model",                                        "",                     MP_AUTH_NONE,       1 },
+};
+
+const mp_preset *mp_presets(int *count) {
+    if (count) *count = (int)(sizeof g_presets / sizeof g_presets[0]);
+    return g_presets;
+}
+const mp_preset *mp_preset_find(const char *id_or_label) {
+    if (!id_or_label || !*id_or_label) return NULL;
+    int n = 0; const mp_preset *p = mp_presets(&n);
+    for (int i = 0; i < n; i++)
+        if (!strcasecmp(p[i].id, id_or_label) || !strcasecmp(p[i].label, id_or_label)) return &p[i];
+    return NULL;
+}
+const mp_preset *mp_preset_by_index(int num) {
+    int n = 0, idx = 0; const mp_preset *p = mp_presets(&n);
+    if (num < 1) return NULL;
+    for (int pass = 0; pass < 2; pass++)
+        for (int i = 0; i < n; i++)
+            if ((pass == 0) == !p[i].local && ++idx == num) return &p[i];
+    return NULL;
+}
+int mp_preset_count_local(void) {
+    int n = 0, c = 0; const mp_preset *p = mp_presets(&n);
+    for (int i = 0; i < n; i++) c += p[i].local ? 1 : 0;
+    return c;
 }
 
 int mp_url_is_loopback_http(const char *url) {
@@ -94,8 +159,14 @@ int mp_cfg_load(mp_config *c, const char *path_or_null) {
             const char *bu = tabstr(&pv, "base_url", b1, sizeof b1);
             const char *bm = tabstr(&pv, "model", b2, sizeof b2);
             const char *be = tabstr(&pv, "key_env", b3, sizeof b3);
+            char bauth[32];
+            const char *bau = tabstr(&pv, "auth", bauth, sizeof bauth);
             if (mp_cfg_find(c, name)) mp_cfg_rm(c, name); /* config overrides built-in default */
-            if (mp_cfg_add(c, name, bk ? bk : "openai", bu ? bu : "", bm ? bm : "", be ? be : "") == 0)
+            mp_auth au = MP_AUTH_BEARER;
+            if (bau && mp_auth_parse(bau, &au)) au = MP_AUTH_BEARER;
+            if (!bau && bk && !strcmp(bk, "anthropic")) au = MP_AUTH_ANTHROPIC;
+            if (mp_cfg_add_ex(c, name, bk ? bk : "openai", bu ? bu : "",
+                              bm ? bm : "", be ? be : "", au) == 0)
                 had_providers = 1;
             else log_warn("config: provider '%s' rejected (bad kind or loopback rule)", name);
         }
@@ -137,8 +208,9 @@ int mp_cfg_save(const mp_config *c) {
             c->session_model[0] ? c->session_model : (act ? act->model : ""),
             c->policy_mode);
     for (int i = 0; i < c->n; i++)
-        fprintf(f, "[provider.%s]\nkind = \"%s\"\nbase_url = \"%s\"\nmodel = \"%s\"%s%s%s\n\n",
-                c->v[i].name, mp_kind_name(c->v[i].kind), c->v[i].base_url, c->v[i].model,
+        fprintf(f, "[provider.%s]\nkind = \"%s\"\nauth = \"%s\"\nbase_url = \"%s\"\nmodel = \"%s\"%s%s%s\n\n",
+                c->v[i].name, mp_kind_name(c->v[i].kind), mp_auth_name(c->v[i].auth),
+                c->v[i].base_url, c->v[i].model,
                 c->v[i].key_env[0] ? "\nkey_env = \"" : "", c->v[i].key_env, c->v[i].key_env[0] ? "\"" : "");
     if (ferror(f) || fclose(f)) { log_error("config: write failed"); unlink(tmp); return -1; }
     if (rename(tmp, path)) { log_error("config: rename -> %s failed: %s", path, strerror(errno)); unlink(tmp); return -1; }
@@ -157,6 +229,16 @@ mp_provider *mp_cfg_active(mp_config *c) {
 }
 int mp_cfg_add(mp_config *c, const char *name, const char *kind,
                const char *base_url, const char *model, const char *key_env) {
+    mp_pkind k;
+    if (mp_kind_parse(kind, &k)) return -2;
+    mp_auth a = MP_AUTH_BEARER;
+    if (k == MP_KIND_ANTHROPIC) a = MP_AUTH_ANTHROPIC;
+    if (k == MP_KIND_OPENAI_LOCAL) a = MP_AUTH_NONE;
+    return mp_cfg_add_ex(c, name, kind, base_url, model, key_env, a);
+}
+int mp_cfg_add_ex(mp_config *c, const char *name, const char *kind,
+                  const char *base_url, const char *model, const char *key_env,
+                  mp_auth auth) {
     if (!c || !name || !*name || strlen(name) > 63) return -1;
     mp_pkind k;
     if (mp_kind_parse(kind, &k)) return -2;
@@ -166,6 +248,7 @@ int mp_cfg_add(mp_config *c, const char *name, const char *kind,
     memset(p, 0, sizeof *p);
     snprintf(p->name, sizeof p->name, "%s", name);
     p->kind = k;
+    p->auth = auth;
     snprintf(p->base_url, sizeof p->base_url, "%s", base_url ? base_url : "");
     snprintf(p->model, sizeof p->model, "%s", model ? model : "");
     snprintf(p->key_env, sizeof p->key_env, "%s", key_env ? key_env : "");
@@ -174,6 +257,12 @@ int mp_cfg_add(mp_config *c, const char *name, const char *kind,
         c->n--; return -5;
     }
     return 0;
+}
+
+int mp_cfg_set_model(mp_config *c, const char *model) {
+    if (!c || !model || !*model) return -1;
+    snprintf(c->session_model, sizeof c->session_model, "%s", model);
+    return mp_cfg_save(c);
 }
 int mp_cfg_rm(mp_config *c, const char *name) {
     for (int i = 0; i < c->n; i++)

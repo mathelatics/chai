@@ -1,0 +1,5 @@
+Script started on 2026-11-01 10:58:34+00:00 [COMMAND="./build/minipi --tui" <not executed on terminal>]
+10:58:34 INFO  /workspaces/chai/src/main.c:82: main: session dir target: /home/codespace/.minipi/sessions
+[?1049h[22;0;0t[?1h=[?25l(B[m[H[2J[?1006l[?1015l[?1002l[?1000l10:58:34 INFO  /workspaces/chai/src/session/store.c:75: store: resumed 34 entries from /home/codespace/.minipi/sessions/tui-current.jsonl
+
+Script done on 2026-11-01 10:58:46+00:00 [COMMAND_EXIT_CODE="0"]
