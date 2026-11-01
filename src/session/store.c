@@ -4,6 +4,7 @@
  * All failures log errno + full path (silent store failures hid a session-dir
  * bug; never again). Store failure is non-fatal by design: the session keeps
  * running in memory, but the user always sees WHY nothing was persisted. */
+#include "util/compat.h"
 #include "session/store.h"
 #include "util/sha256.h"
 #include "util/paths.h"

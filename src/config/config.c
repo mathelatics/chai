@@ -1,4 +1,5 @@
 /* config.toml provider registry: load/save + CRUD used by /connect commands. */
+#include "util/compat.h"
 #include "config/config.h"
 #include "util/paths.h"
 #include "tomlc17.h"

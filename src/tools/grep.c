@@ -3,6 +3,7 @@
  * matching (case-folded via regex when ignore_case). Skips binary files (NUL
  * byte in first 8 KiB) and heavy dirs; bounded match count. Output lines are
  * "relpath:lineno: text" — exactly what models expect. Read-only. */
+#include "util/compat.h"
 #include "tools/registry.h"
 #include <stdio.h>
 #include <stdlib.h>

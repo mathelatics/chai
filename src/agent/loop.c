@@ -1,3 +1,4 @@
+#include "util/compat.h"
 #include "loop.h"
 #include "tools/registry.h"
 #include "providers/provider.h"

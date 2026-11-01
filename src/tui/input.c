@@ -8,6 +8,7 @@
  *   -8 ctrl-left(word back)   -9 ctrl-right(word fwd)  -10 paste-start
  *   -11 paste-end */
 #define _GNU_SOURCE
+#include "util/compat.h"
 #include "tui/input.h"
 #include "util/utf8.h"
 #include <stdio.h>

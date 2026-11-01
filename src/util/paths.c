@@ -1,3 +1,4 @@
+#include "util/compat.h"
 #include "paths.h"
 #include "log.h"
 #include <errno.h>

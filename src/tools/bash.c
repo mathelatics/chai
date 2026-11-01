@@ -1,3 +1,4 @@
+#include "util/compat.h"
 #include "tools/registry.h"
 #include <stdio.h>
 #include <stdlib.h>

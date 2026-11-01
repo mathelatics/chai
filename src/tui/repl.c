@@ -4,6 +4,7 @@
  * permission modes, and per-tool-call approval prompts with risk flags.
  * Keys never touch this process — providers store env-var NAMES only; values
  * live in .env exported to the broker. */
+#include "util/compat.h"
 #include "tui/app.h"
 #include "tui/disp.h"
 #include "tui/input.h"

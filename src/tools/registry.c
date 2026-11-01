@@ -1,3 +1,4 @@
+#include "util/compat.h"
 #include "registry.h"
 #include "tools/output_cap.h"
 #include "util/schema.h"
